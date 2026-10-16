@@ -785,10 +785,12 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 raise ApiError('非法的静态资源路径', 403)
         if not os.path.isfile(target):
             raise ApiError(f'资源不存在: {route}', 404)
-        return self._serve_file(target, download=False)
+        # 每次回源校验，避免更新前端后刷新页面仍加载旧的 app.js / style.css
+        return self._serve_file(target, download=False, cache_control='no-cache')
 
     # ------------------------------------------------------------ 文件下发
-    def _serve_file(self, full_path: str, download: bool = False, filename: str = ''):
+    def _serve_file(self, full_path: str, download: bool = False, filename: str = '',
+                    cache_control: str = ''):
         try:
             stat = os.stat(full_path)
         except OSError as exc:
@@ -833,6 +835,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(length))
         self.send_header('Accept-Ranges', 'bytes')
         self.send_header('Last-Modified', self.date_time_string(stat.st_mtime))
+        if cache_control:
+            self.send_header('Cache-Control', cache_control)
         if status == 206:
             self.send_header('Content-Range', f'bytes {start}-{end}/{size}')
         if download:
