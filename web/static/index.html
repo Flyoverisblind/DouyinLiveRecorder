@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="never">
+<title>DouyinLiveRecorder 控制台</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎬</text></svg>">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="app">
+  <!-- ============================ 侧边栏 ============================ -->
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <div class="brand-logo">DLR</div>
+      <div class="brand-text">
+        <strong data-i18n="appName">直播录制控制台</strong>
+        <span id="brandVersion">v-</span>
+      </div>
+    </div>
+
+    <nav class="nav" id="nav">
+      <button class="nav-item" data-page="dashboard">
+        <span class="nav-icon" data-icon="dashboard"></span><span data-i18n="navDashboard">概览</span>
+      </button>
+      <button class="nav-item" data-page="urls">
+        <span class="nav-icon" data-icon="link"></span><span data-i18n="navUrls">直播间地址</span>
+        <span class="nav-badge" id="navUrlBadge"></span>
+      </button>
+      <div class="nav-group" data-i18n="navSettingsGroup">参数设置</div>
+      <button class="nav-item" data-page="config" data-section="录制设置">
+        <span class="nav-icon" data-icon="video"></span><span data-i18n="navRecording">录制设置</span>
+      </button>
+      <button class="nav-item" data-page="config" data-section="推送配置">
+        <span class="nav-icon" data-icon="bell"></span><span data-i18n="navPush">推送配置</span>
+      </button>
+      <button class="nav-item" data-page="config" data-section="Cookie">
+        <span class="nav-icon" data-icon="cookie"></span><span data-i18n="navCookie">Cookie</span>
+      </button>
+      <button class="nav-item" data-page="config" data-section="账号密码">
+        <span class="nav-icon" data-icon="user"></span><span data-i18n="navAccount">账号密码</span>
+      </button>
+      <button class="nav-item" data-page="config" data-section="Authorization">
+        <span class="nav-icon" data-icon="key"></span><span data-i18n="navAuth">授权令牌</span>
+      </button>
+      <div class="nav-group" data-i18n="navRuntimeGroup">运行</div>
+      <button class="nav-item" data-page="logs">
+        <span class="nav-icon" data-icon="terminal"></span><span data-i18n="navLogs">实时日志</span>
+      </button>
+      <button class="nav-item" data-page="files">
+        <span class="nav-icon" data-icon="folder"></span><span data-i18n="navFiles">录制文件</span>
+      </button>
+    </nav>
+
+    <div class="sidebar-foot">
+      <button class="icon-btn" id="themeToggle" title="切换主题"><span data-icon="moon"></span></button>
+      <button class="icon-btn" id="langToggle" title="Switch language">EN</button>
+      <a class="icon-btn" href="https://github.com/ihmily/DouyinLiveRecorder" target="_blank" rel="noreferrer"
+         title="GitHub"><span data-icon="github"></span></a>
+    </div>
+  </aside>
+
+  <!-- ============================ 主区域 ============================ -->
+  <main class="main">
+    <header class="topbar">
+      <button class="icon-btn only-mobile" id="menuToggle"><span data-icon="menu"></span></button>
+      <h1 id="pageTitle">概览</h1>
+      <div class="topbar-spacer"></div>
+
+      <div class="status-pill" id="statusPill" title="录制进程状态">
+        <span class="dot"></span><span id="statusText">未运行</span>
+      </div>
+
+      <button class="btn primary" id="btnStart"><span data-icon="play"></span><span data-i18n="start">启动录制</span></button>
+      <button class="btn danger" id="btnStop" disabled><span data-icon="stop"></span><span data-i18n="stop">停止</span></button>
+      <button class="btn ghost" id="btnRestart" title="重启"><span data-icon="refresh"></span></button>
+    </header>
+
+    <div class="content" id="content">
+
+      <!-- ---------------------------- 概览 ---------------------------- -->
+      <section class="page" data-page="dashboard">
+        <div class="alert warn hidden" id="alertDeps"></div>
+
+        <div class="grid stats">
+          <div class="card stat">
+            <div class="stat-label" data-i18n="statMonitoring">监测中的直播间</div>
+            <div class="stat-value" id="statMonitoring">0</div>
+          </div>
+          <div class="card stat">
+            <div class="stat-label" data-i18n="statRecording">正在录制</div>
+            <div class="stat-value" id="statRecording">0</div>
+          </div>
+          <div class="card stat">
+            <div class="stat-label" data-i18n="statErrors">瞬时错误数</div>
+            <div class="stat-value" id="statErrors">0</div>
+          </div>
+          <div class="card stat">
+            <div class="stat-label" data-i18n="statDisk">磁盘剩余</div>
+            <div class="stat-value" id="statDisk">-</div>
+            <div class="stat-sub" id="statDiskPath"></div>
+          </div>
+        </div>
+
+        <div class="grid two">
+          <div class="card">
+            <div class="card-head"><h3 data-i18n="processCard">录制进程</h3>
+              <span class="tag" id="procTag">-</span></div>
+            <dl class="kv">
+              <dt data-i18n="kvPid">进程 ID</dt><dd id="kvPid">-</dd>
+              <dt data-i18n="kvUptime">运行时长</dt><dd id="kvUptime">-</dd>
+              <dt data-i18n="kvQuality">当前画质</dt><dd id="kvQuality">-</dd>
+              <dt data-i18n="kvFormat">输出格式</dt><dd id="kvFormat">-</dd>
+              <dt data-i18n="kvExit">上次退出码</dt><dd id="kvExit">-</dd>
+            </dl>
+          </div>
+
+          <div class="card">
+            <div class="card-head"><h3 data-i18n="envCard">运行环境</h3>
+              <button class="btn tiny ghost" id="btnRecheck"><span data-icon="refresh"></span><span data-i18n="recheck">重新检测</span></button>
+            </div>
+            <dl class="kv">
+              <dt data-i18n="kvPython">Python 解释器</dt><dd id="kvPython" class="ellipsis">-</dd>
+              <dt data-i18n="kvDeps">依赖包</dt><dd id="kvDeps">-</dd>
+              <dt data-i18n="kvFfmpeg">ffmpeg</dt><dd id="kvFfmpeg">-</dd>
+              <dt data-i18n="kvSavePath">录制保存路径</dt>
+                <dd><span id="kvSavePath" class="ellipsis">-</span>
+                <button class="btn tiny ghost" id="btnOpenFolder" title="打开文件夹"><span data-icon="external"></span></button></dd>
+              <dt data-i18n="kvRoot">项目目录</dt><dd id="kvRoot" class="ellipsis">-</dd>
+            </dl>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h3 data-i18n="recentFiles">最近录制的文件</h3>
+            <button class="btn tiny ghost" data-goto="files"><span data-i18n="viewAll">查看全部</span></button></div>
+          <div id="recentFiles" class="file-mini"></div>
+        </div>
+      </section>
+
+      <!-- ---------------------------- 直播间地址 ---------------------------- -->
+      <section class="page hidden" data-page="urls">
+        <div class="alert info" data-i18n="urlsHint">
+          提示：程序运行时修改此列表会在下一个循环周期自动生效；带有 # 前缀的行表示「已停用」，不会被录制。
+        </div>
+
+        <div class="card">
+          <div class="toolbar">
+            <div class="input-group grow">
+              <span data-icon="search" class="input-icon"></span>
+              <input type="search" id="urlSearch" placeholder="搜索地址或主播名">
+            </div>
+            <select id="urlFilter" class="select">
+              <option value="all" data-i18n="filterAll">全部</option>
+              <option value="enabled" data-i18n="filterEnabled">已启用</option>
+              <option value="disabled" data-i18n="filterDisabled">已停用</option>
+              <option value="invalid" data-i18n="filterInvalid">地址异常</option>
+            </select>
+            <button class="btn ghost" id="btnEnableAll"><span data-icon="check"></span><span data-i18n="enableAll">全部启用</span></button>
+            <button class="btn ghost" id="btnDisableAll"><span data-icon="ban"></span><span data-i18n="disableAll">全部停用</span></button>
+            <button class="btn danger" id="btnDeleteSelected"><span data-icon="trash"></span><span data-i18n="deleteSelected">删除选中</span></button>
+          </div>
+
+          <div class="add-row">
+            <select id="newQuality" class="select">
+              <option value="" data-i18n="useDefault">默认画质</option>
+              <option value="原画">原画</option><option value="蓝光">蓝光</option>
+              <option value="超清">超清</option><option value="高清">高清</option>
+              <option value="标清">标清</option><option value="流畅">流畅</option>
+            </select>
+            <input type="text" id="newUrl" class="input grow" placeholder="直播间地址，例如 https://live.douyin.com/123456">
+            <input type="text" id="newName" class="input" placeholder="主播名（可选）" style="max-width:180px">
+            <button class="btn primary" id="btnAddUrl"><span data-icon="plus"></span><span data-i18n="add">添加</span></button>
+            <button class="btn ghost" id="btnImport"><span data-icon="upload"></span><span data-i18n="bulkImport">批量导入</span></button>
+          </div>
+
+          <div class="table-wrap">
+            <table class="table" id="urlTable">
+              <thead>
+                <tr>
+                  <th style="width:36px"><input type="checkbox" id="urlCheckAll"></th>
+                  <th style="width:88px" data-i18n="colStatus">状态</th>
+                  <th style="width:120px" data-i18n="colQuality">画质</th>
+                  <th data-i18n="colUrl">直播间地址</th>
+                  <th style="width:180px" data-i18n="colName">主播名</th>
+                  <th style="width:120px" data-i18n="colActions">操作</th>
+                </tr>
+              </thead>
+              <tbody id="urlTbody"></tbody>
+            </table>
+          </div>
+          <div class="table-foot"><span id="urlSummary"></span></div>
+        </div>
+      </section>
+
+      <!-- ---------------------------- 参数设置（通用） ---------------------------- -->
+      <section class="page hidden" data-page="config">
+        <div class="section-head">
+          <div>
+            <h2 id="cfgTitle">参数设置</h2>
+            <p class="muted" id="cfgDesc"></p>
+          </div>
+          <div class="input-group search-box">
+            <span data-icon="search" class="input-icon"></span>
+            <input type="search" id="cfgSearch" placeholder="搜索参数">
+          </div>
+        </div>
+        <div class="card" id="cfgCard">
+          <div class="field-grid" id="cfgFields"></div>
+        </div>
+        <div class="savebar hidden" id="saveBar">
+          <span id="saveBarText">有 0 项修改未保存</span>
+          <div class="savebar-actions">
+            <button class="btn ghost" id="btnDiscard" data-i18n="discard">放弃</button>
+            <button class="btn primary" id="btnSave"><span data-icon="save"></span><span data-i18n="save">保存设置</span></button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ---------------------------- 实时日志 ---------------------------- -->
+      <section class="page hidden" data-page="logs">
+        <div class="card">
+          <div class="toolbar">
+            <div class="seg" id="logSource">
+              <button class="seg-item active" data-source="live" data-i18n="logLive">实时输出</button>
+              <button class="seg-item" data-source="file" data-i18n="logFile">日志文件</button>
+            </div>
+            <select id="logFileSelect" class="select hidden"></select>
+            <div class="input-group grow">
+              <span data-icon="search" class="input-icon"></span>
+              <input type="search" id="logSearch" placeholder="过滤关键字">
+            </div>
+            <div class="chips" id="logLevels">
+              <button class="chip active" data-level="OUT">OUT</button>
+              <button class="chip active" data-level="INFO">INFO</button>
+              <button class="chip active" data-level="WARNING">WARN</button>
+              <button class="chip active" data-level="ERROR">ERROR</button>
+            </div>
+            <button class="btn ghost" id="btnLogPause"><span data-icon="pause"></span><span data-i18n="pause">暂停</span></button>
+            <button class="btn ghost" id="btnLogClear"><span data-icon="trash"></span><span data-i18n="clear">清空</span></button>
+            <span class="conn" id="logConn">-</span>
+          </div>
+          <div class="console" id="console"></div>
+          <div class="table-foot">
+            <span id="logSummary"></span>
+            <label class="inline-check"><input type="checkbox" id="logAutoScroll" checked> <span data-i18n="autoScroll">自动滚动</span></label>
+          </div>
+        </div>
+      </section>
+
+      <!-- ---------------------------- 录制文件 ---------------------------- -->
+      <section class="page hidden" data-page="files">
+        <div class="card">
+          <div class="toolbar">
+            <button class="btn ghost" id="btnUp" title="上级目录"><span data-icon="up"></span></button>
+            <button class="btn ghost" id="btnRefreshFiles"><span data-icon="refresh"></span></button>
+            <select id="fileDrives" class="select hidden" title="切换磁盘"></select>
+            <button class="btn ghost" id="btnGoRoot"><span data-icon="folder"></span><span data-i18n="goSaveDir">录制目录</span></button>
+            <div class="input-group grow">
+              <span data-icon="search" class="input-icon"></span>
+              <input type="search" id="fileSearch" placeholder="搜索文件名">
+            </div>
+            <label class="inline-check"><input type="checkbox" id="fileRecursive"> <span data-i18n="recursive">包含子目录</span></label>
+            <button class="btn ghost" id="btnOpenFolder2"><span data-icon="external"></span><span data-i18n="openFolder">打开文件夹</span></button>
+          </div>
+          <div class="breadcrumb" id="filePath"></div>
+          <div class="alert warn hidden" id="fileHint"></div>
+          <div class="table-wrap">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th data-i18n="colFileName">名称</th>
+                  <th style="width:110px" data-i18n="colSize">大小</th>
+                  <th style="width:170px" data-i18n="colTime">修改时间</th>
+                  <th style="width:210px" data-i18n="colActions">操作</th>
+                </tr>
+              </thead>
+              <tbody id="fileTbody"></tbody>
+            </table>
+          </div>
+          <div class="table-foot"><span id="fileSummary"></span></div>
+        </div>
+      </section>
+
+    </div>
+  </main>
+</div>
+
+<!-- ============================ 弹窗 ============================ -->
+<div class="modal-mask hidden" id="modalMask">
+  <div class="modal" id="modal">
+    <div class="modal-head"><h3 id="modalTitle"></h3>
+      <button class="icon-btn" id="modalClose"><span data-icon="close"></span></button></div>
+    <div class="modal-body" id="modalBody"></div>
+    <div class="modal-foot" id="modalFoot"></div>
+  </div>
+</div>
+
+<div class="toasts" id="toasts"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
