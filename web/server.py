@@ -999,6 +999,53 @@ def find_free_port(host: str, preferred: int) -> int:
     raise SystemExit(f'端口 {preferred} 及相邻端口都被占用，请用 --port 指定其它端口')
 
 
+# ---------------------------------------------------------------- 后台运行支持
+
+PID_FILE_REL = os.path.join('logs', 'console.pid')
+
+
+def ensure_std_streams(project_root: str) -> None:
+    """用 pythonw.exe 启动时没有控制台，sys.stdout/stderr 会是 None。
+
+    此时任何 print() 都会抛 AttributeError 把进程打死，所以把它们重定向到
+    logs/console.log —— 后台模式既不丢日志，也不会因为一句 print 崩掉。
+    """
+    if sys.stdout is not None and sys.stderr is not None:
+        return
+    try:
+        log_dir = os.path.join(project_root, 'logs')
+        os.makedirs(log_dir, exist_ok=True)
+        stream = open(os.path.join(log_dir, 'console.log'), 'a',
+                      encoding='utf-8', buffering=1)
+    except OSError:
+        return
+    if sys.stdout is None:
+        sys.stdout = stream
+    if sys.stderr is None:
+        sys.stderr = stream
+
+
+def write_pid_file(project_root: str, port: int) -> str:
+    """记录 pid 和实际端口，供后台停止脚本使用（端口可能因占用而顺延）。"""
+    path = os.path.join(project_root, PID_FILE_REL)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as fp:
+            fp.write(f'{os.getpid()}\n{port}\n')
+        return path
+    except OSError:
+        return ''
+
+
+def remove_pid_file(path: str) -> None:
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
 def main():
     parser = argparse.ArgumentParser(description='DouyinLiveRecorder 可视化控制台')
     parser.add_argument('--host', default='127.0.0.1', help='监听地址，默认 127.0.0.1（仅本机可访问）')
@@ -1010,6 +1057,7 @@ def main():
     args = parser.parse_args()
 
     project_root = os.path.abspath(args.project_root)
+    ensure_std_streams(project_root)      # pythonw 后台模式没有控制台，先把输出接住
     python_exe = args.python or paths.pick_python(project_root)
     port = find_free_port(args.host, args.port)
 
@@ -1037,11 +1085,13 @@ def main():
     if args.open and os.environ.get('DLR_NO_BROWSER') != '1':
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
 
+    pid_file = write_pid_file(project_root, port)
     try:
         server.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
         print('\n正在关闭可视化控制台 ...')
     finally:
+        remove_pid_file(pid_file)
         app._stop_event.set()
         server.shutdown()
         server.server_close()
