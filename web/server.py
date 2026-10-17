@@ -31,6 +31,8 @@ if WEB_DIR not in sys.path:
 
 import config_store          # noqa: E402
 import files_api             # noqa: E402
+import media_jobs            # noqa: E402
+import media_tools           # noqa: E402
 import paths                 # noqa: E402
 from process_manager import EnvironmentProbe, RecorderProcess  # noqa: E402
 import schema as schema_mod  # noqa: E402
@@ -77,6 +79,8 @@ class WebConsole:
         self.log_dir = os.path.join(self.project_root, paths.LOG_DIR_REL)
         self.recorder = RecorderProcess(self.project_root, python_exe)
         self.probe = EnvironmentProbe(self.project_root, python_exe)
+        # 合并 / 裁切这类后处理在后台串行执行，避免长任务把请求卡死
+        self.media_jobs = media_jobs.MediaJobManager(self.project_root)
         self.version = self._read_version()
         # 只监听本机时，进一步拒绝非本机 Host 的请求（DNS rebinding 防护）
         self.enforce_local_host = host in ('127.0.0.1', 'localhost', '::1')
@@ -723,6 +727,116 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         if route == '/api/open' and method == 'POST':
             target = body().get('path') or paths.resolve_save_path(app.project_root)[0]
             return self._json(files_api.open_in_file_manager(target))
+
+        # ---------------- 媒体后处理（多段合并 / 裁黑边转 16:9）
+        if route == '/api/media/analyze' and method == 'POST':
+            payload = body()
+            targets = payload.get('paths') or ([payload['path']] if payload.get('path') else [])
+            targets = [p for p in targets if p]
+            if not targets:
+                raise ApiError('请先选择要处理的文件')
+            truncated = len(targets) > 24
+            targets = targets[:24]
+            samples = max(1, min(int(payload.get('samples', 3) or 3), 8))
+            try:
+                result = media_tools.analyze_selection(
+                    targets, samples=samples, project_root=app.project_root)
+            except media_tools.MediaError as exc:
+                raise ApiError(str(exc)) from exc
+            result['truncated'] = truncated
+            return self._json({'ok': True, **result})
+
+        if route == '/api/media/merge' and method == 'POST':
+            payload = body()
+            out_dir = payload.get('out_dir') or None
+            if out_dir and not os.path.isdir(out_dir):
+                raise ApiError(f'输出目录不存在: {out_dir}')
+            try:
+                prepared = media_tools.prepare_merge(
+                    payload.get('paths') or [], app.project_root,
+                    out_dir=out_dir, order=payload.get('order', 'name'))
+            except media_tools.MediaError as exc:
+                raise ApiError(str(exc)) from exc
+
+            faststart = payload.get('faststart', True) is not False
+            drop_source = bool(payload.get('drop_source', False))
+            paths_to_merge = prepared['paths']
+            output = prepared['output']
+
+            def _run_merge(job, paths_to_merge=paths_to_merge, output=output,
+                           faststart=faststart, drop_source=drop_source):
+                return media_tools.merge(paths_to_merge, app.project_root, job=job,
+                                         faststart=faststart, drop_source=drop_source,
+                                         output=output)
+
+            job = app.media_jobs.start(
+                'merge', f'合并 {len(paths_to_merge)} 个文件', _run_merge,
+                payload={'paths': paths_to_merge, 'output': output})
+            return self._json({'ok': True, 'job': job.to_dict(), 'preview': {
+                'count': len(paths_to_merge),
+                'output': output,
+                'total_duration': prepared['total_duration'],
+                'warnings': prepared['warnings'],
+            }})
+
+        if route == '/api/media/to16x9' and method == 'POST':
+            payload = body()
+            targets = [p for p in (payload.get('paths') or []) if p]
+            if not targets and payload.get('path'):
+                targets = [payload['path']]
+            if not targets:
+                raise ApiError('请先选择要处理的文件')
+            out_dir = payload.get('out_dir') or None
+            if out_dir and not os.path.isdir(out_dir):
+                raise ApiError(f'输出目录不存在: {out_dir}')
+            try:
+                crf = int(payload.get('crf') or media_tools.DEFAULT_CRF)
+            except (TypeError, ValueError):
+                raise ApiError('crf 必须是整数') from None
+            if not 0 <= crf <= 51:
+                raise ApiError('crf 取值范围是 0-51')
+            preset = payload.get('preset') or media_tools.DEFAULT_PRESET
+            prefer_lossless = payload.get('prefer_lossless', True) is not False
+            allow_content_loss = bool(payload.get('allow_content_loss', False))
+            drop_source = bool(payload.get('drop_source', False))
+
+            for target in targets:
+                if not os.path.isfile(target):
+                    raise ApiError(f'文件不存在: {target}')
+                try:
+                    media_tools.probe(target, app.project_root)
+                except media_tools.MediaError as exc:
+                    raise ApiError(str(exc)) from exc
+
+            jobs = []
+            for target in targets:
+
+                def _run_convert(job, target=target):
+                    return media_tools.to_16x9(
+                        target, app.project_root, out_dir=out_dir, job=job,
+                        prefer_lossless=prefer_lossless, crf=crf, preset=preset,
+                        drop_source=drop_source, allow_content_loss=allow_content_loss)
+
+                job = app.media_jobs.start(
+                    'to16x9', f'转为 16:9：{os.path.basename(target)}', _run_convert,
+                    payload={'path': target})
+                jobs.append(job.to_dict())
+            return self._json({'ok': True, 'jobs': jobs, 'count': len(jobs)})
+
+        if route == '/api/media/jobs' and method == 'GET':
+            return self._json({
+                'ok': True,
+                'items': app.media_jobs.list(limit=max(1, min(arg('limit', 40, int), 200))),
+                'active': app.media_jobs.active_count(),
+            })
+
+        if route == '/api/media/jobs/cancel' and method == 'POST':
+            job_id = body().get('id') or ''
+            if not job_id:
+                raise ApiError('缺少任务 id')
+            cancelled = app.media_jobs.cancel(job_id)
+            return self._json({'ok': cancelled, 'id': job_id,
+                               'error': '' if cancelled else '任务不存在或已结束'})
 
         raise ApiError(f'接口不存在: {method} {route}', 404)
 

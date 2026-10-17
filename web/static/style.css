@@ -414,6 +414,27 @@ input[type="checkbox"] { accent-color: var(--accent); width: 15px; height: 15px;
 .toast.warn { border-left-color: var(--warn); }
 @keyframes slideIn { from { transform: translateX(20px); opacity: 0; } to { transform: none; opacity: 1; } }
 
+/* ------------------------------------------------------------- 媒体处理任务 */
+.job-row {
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 10px 12px; margin-bottom: 9px; background: var(--panel-2);
+}
+.job-row:last-child { margin-bottom: 0; }
+.job-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.job-head strong { font-size: 13px; font-weight: 600; }
+.job-bar {
+  height: 6px; border-radius: 999px; background: var(--border);
+  margin: 8px 0 6px; overflow: hidden;
+}
+.job-bar > span {
+  display: block; height: 100%; width: 0; border-radius: 999px;
+  background: var(--accent); transition: width .3s ease;
+}
+.job-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 12px; }
+.job-detail { font-size: 12px; margin-top: 5px; color: var(--muted); word-break: break-all; }
+.job-detail.err-text { color: var(--danger); }
+.table td input[type="checkbox"] { cursor: pointer; width: 15px; height: 15px; accent-color: var(--accent); }
+
 .only-mobile { display: none; }
 
 /* ------------------------------------------------------------- 响应式 */

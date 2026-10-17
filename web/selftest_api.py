@@ -12,7 +12,10 @@
 import argparse
 import json
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 
 import requests
@@ -143,6 +146,75 @@ def main():
           and not r.json().get('deleted'), str(r.json().get('errors'))[:90])
     r = get('/api/browse')
     check('GET /api/browse', r.status_code == 200 and 'dirs' in r.json(), str(r.json().get('path')))
+
+    print('== 媒体后处理接口 ==')
+    r = post('/api/media/analyze', {'paths': []})
+    check('analyze 空选择被拒绝(400)', r.status_code == 400, str(r.json().get('error'))[:50])
+
+    r = post('/api/media/analyze', {'paths': [os.path.join(os.sep, 'no_such_file_xyz.mp4')]})
+    items = r.json().get('items') or [{}]
+    check('analyze 不存在的文件逐项报错', r.status_code == 200 and items[0].get('ok') is False,
+          str(items[0].get('error'))[:60])
+
+    r = post('/api/media/merge', {'paths': ['C:\\Windows\\notepad.exe']})
+    check('merge 单文件被拒绝(400)', r.status_code == 400, str(r.json().get('error'))[:60])
+
+    r = get('/api/media/jobs')
+    check('GET /api/media/jobs', r.status_code == 200 and isinstance(r.json().get('items'), list))
+
+    r = post('/api/media/jobs/cancel', {'id': 'not-a-real-job'})
+    check('取消不存在的任务返回 ok=False', r.status_code == 200 and r.json().get('ok') is False)
+
+    r = post('/api/media/to16x9', {'paths': ['C:\\no_such_media_file.mp4']})
+    check('to16x9 不存在的文件被拒绝(400)', r.status_code == 400, str(r.json().get('error'))[:60])
+
+    # 端到端：真造一段「底部黑边」视频，走接口转 16:9，确认走无损路径
+    tmpdir = ''
+    try:
+        import media_tools as mt
+        ffmpeg = mt.find_ffmpeg()
+        tmpdir = tempfile.mkdtemp(prefix='dlr_api_media_')
+        clip = os.path.join(tmpdir, 'clip.mp4')
+        subprocess.run([
+            ffmpeg, '-hide_banner', '-v', 'error', '-y',
+            '-f', 'lavfi', '-i', 'testsrc2=s=640x360:r=30:d=2',
+            '-f', 'lavfi', '-i', 'color=black:s=640x600:r=30:d=2',
+            '-filter_complex', '[1:v][0:v]overlay=0:0[v]', '-map', '[v]',
+            '-c:v', 'libx264', '-crf', '20', '-pix_fmt', 'yuv420p', '-shortest', clip,
+        ], capture_output=True, timeout=120)
+
+        r = post('/api/media/analyze', {'paths': [clip], 'samples': 3})
+        plan = ((r.json().get('items') or [{}])[0]).get('plan') or {}
+        check('analyze 识别出底部黑边', plan.get('action') == 'crop', str(plan.get('action')))
+
+        r = post('/api/media/to16x9', {'paths': [clip], 'crf': 'abc'})
+        check('  crf 非法被拒绝(400)', r.status_code == 400, str(r.json().get('error'))[:50])
+
+        r = post('/api/media/to16x9', {'paths': [clip]})
+        jobs = r.json().get('jobs') or [{}]
+        job_id = jobs[0].get('id', '')
+        check('to16x9 已入队', r.status_code == 200 and bool(job_id))
+
+        job = {}
+        for _ in range(80):
+            time.sleep(0.5)
+            items = get('/api/media/jobs').json().get('items', [])
+            job = next((i for i in items if i.get('id') == job_id), {})
+            if job.get('status') in ('done', 'error', 'cancelled'):
+                break
+        check('  任务执行完成', job.get('status') == 'done', str(job.get('error'))[:80])
+        result = job.get('result') or {}
+        check('  走了无损路径', result.get('lossless') is True, str(result.get('mode')))
+        if result.get('output'):
+            info = mt.probe(result['output'])
+            check('  输出为 640x360',
+                  (info['video']['width'], info['video']['height']) == (640, 360),
+                  f"{info['video']['width']}x{info['video']['height']}")
+    except Exception as exc:  # noqa: BLE001
+        check('媒体端到端测试', False, str(exc)[:120])
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
     print('== 安全防护 ==')
     r = requests.post(base + '/api/control/start', data='{"x":1}',

@@ -36,6 +36,8 @@ const ICONS = {
   up: '<path d="M4 12l1.41 1.41L11 7.83V20h2V7.83l5.58 5.59L20 12l-8-8-8 8z"/>',
   file: '<path d="M6 2c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V8l-6-6H6zm7 7V3.5L18.5 9H13z"/>',
   image: '<path d="M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z"/>',
+  merge: '<path d="M17 20.41L18.41 19 15 15.59 13.59 17 17 20.41zM7.5 8H11v5.59L5.59 19 7 20.41l6-6V8h3.5L12 3.5 7.5 8z"/>',
+  crop: '<path d="M17 15h2V7c0-1.1-.9-2-2-2h-8v2h8v8zM7 17V1H5v4H1v2h4v10c0 1.1.9 2 2 2h10v4h2v-4h4v-2H7z"/>',
 };
 
 function icon(name, size = 16) {
@@ -81,6 +83,16 @@ const I18N = {
     importModeAppend: '追加到现有列表', importModeReplace: '替换现有列表', doImport: '导入',
     filterPlaceholder: '搜索参数', searchUrl: '搜索地址或主播名', searchFile: '搜索文件名',
     copied: '已复制', exitCode: '退出码',
+    mergeSelected: '合并所选', to16x9: '转为16:9', mediaTasks: '媒体处理任务',
+    hideJobs: '收起', showJobs: '展开', selectAllFiles: '全选',
+    fileSelected: '已选 {n} 个', nothingSelected: '请先勾选要处理的文件',
+    needTwoFiles: '请至少勾选 2 个文件才能合并',
+    confirmMerge: '把选中的 {n} 个文件无损拼接为一个视频？\n按文件名顺序拼接（_000/_001…），输出到同一目录，不会重新编码。',
+    confirmTo169: '把选中的 {n} 个文件裁掉黑边并转为 16:9？\n能无损时只改码流头、不重新编码；否则会重编码（较慢）。',
+    mergeStarted: '已加入合并队列', convertStarted: '已加入 {n} 个转换任务',
+    jobQueued: '排队中', jobRunning: '处理中', jobDone: '已完成', jobError: '失败', jobCancelled: '已取消',
+    cancelJob: '取消', losslessBadge: '无损', reencodedBadge: '已重编码',
+    jobsRunningHint: '{n} 个任务进行中',
   },
   en: {
     appName: 'Live Recorder Console', navDashboard: 'Overview', navUrls: 'Stream URLs',
@@ -119,6 +131,16 @@ const I18N = {
     importModeAppend: 'Append to list', importModeReplace: 'Replace list', doImport: 'Import',
     filterPlaceholder: 'Search options', searchUrl: 'Search URL or streamer', searchFile: 'Search filename',
     copied: 'Copied', exitCode: 'exit code',
+    mergeSelected: 'Merge selected', to16x9: 'To 16:9', mediaTasks: 'Media tasks',
+    hideJobs: 'Hide', showJobs: 'Show', selectAllFiles: 'Select all',
+    fileSelected: '{n} selected', nothingSelected: 'Select a file first',
+    needTwoFiles: 'Select at least 2 files to merge',
+    confirmMerge: 'Merge the {n} selected files into one video without re-encoding?\nFiles are joined in filename order (_000/_001…), output goes next to the source.',
+    confirmTo169: 'Crop the black bars and convert the {n} selected file(s) to 16:9?\nLossless when possible (bitstream header only); otherwise re-encodes (slower).',
+    mergeStarted: 'Added to merge queue', convertStarted: 'Queued {n} conversion task(s)',
+    jobQueued: 'Queued', jobRunning: 'Running', jobDone: 'Done', jobError: 'Failed', jobCancelled: 'Cancelled',
+    cancelJob: 'Cancel', losslessBadge: 'lossless', reencodedBadge: 're-encoded',
+    jobsRunningHint: '{n} task(s) running',
   },
 };
 
@@ -134,6 +156,12 @@ const S = {
   urlSelected: new Set(),
   files: null,
   filePath: '',
+  fileSelected: new Set(),
+  mediaJobs: [],
+  jobsTimer: null,
+  jobsBusy: false,
+  jobsHidden: false,
+  jobsWasActive: false,
   state: null,
   logEntries: [],
   logIds: new Set(),
@@ -895,11 +923,14 @@ async function loadFiles(path, skipHash) {
     const data = await api(`/api/files?${params.toString()}`);
     S.files = data;
     S.filePath = data.path;
+    // 目录变化后丢弃已不在当前列表里的勾选，避免误处理不可见的文件
+    const visible = new Set((data.files || []).map((f) => f.path));
+    Array.from(S.fileSelected).forEach((p) => { if (!visible.has(p)) S.fileSelected.delete(p); });
     if (!skipHash && S.page === 'files') syncHash({ replace: true });
     renderFiles();
   } catch (err) {
     toast(err.message, 'err');
-    $('#fileTbody').innerHTML = `<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:24px">${esc(err.message)}</td></tr>`;
+    $('#fileTbody').innerHTML = `<tr><td colspan="5" style="text-align:center;color:var(--muted);padding:24px">${esc(err.message)}</td></tr>`;
   }
 }
 
@@ -915,6 +946,7 @@ function renderFiles() {
   if (!data.recursive) {
     data.dirs.forEach((d) => {
       rows.push(`<tr>
+        <td></td>
         <td><a href="#" class="dir-link" data-path="${esc(d.path)}">${icon('folder')}<span>${esc(d.name)}</span></a></td>
         <td class="muted">-</td>
         <td class="muted mono">${esc(d.mtime_text)}</td>
@@ -924,7 +956,9 @@ function renderFiles() {
   }
   data.files.forEach((f) => {
     const playable = ['mp4', 'webm', 'm4v', 'mov', 'ogv'].includes(f.ext);
+    const checked = S.fileSelected.has(f.path) ? ' checked' : '';
     rows.push(`<tr>
+      <td><input type="checkbox" class="file-check" data-path="${esc(f.path)}"${checked}></td>
       <td title="${esc(f.rel || f.name)}"><span class="file-name">${icon(f.kind === 'video' ? 'video' : f.kind === 'audio' ? 'bell' : 'file')}<span>${esc(f.name)}</span></span></td>
       <td class="mono">${humanSize(f.size)}</td>
       <td class="muted mono">${esc(f.mtime_text)}</td>
@@ -936,7 +970,7 @@ function renderFiles() {
     </tr>`);
   });
   tbody.innerHTML = rows.length ? rows.join('')
-    : `<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:26px">${t('noData')}</td></tr>`;
+    : `<tr><td colspan="5" style="text-align:center;color:var(--muted);padding:26px">${t('noData')}</td></tr>`;
 
   // 面包屑：任意层级都能点，方便从 C 盘一路点到 D 盘
   const parts = data.path.replace(/\\/g, '/').split('/').filter(Boolean);
@@ -979,6 +1013,116 @@ function renderFiles() {
   $('#fileSummary').textContent = S.lang === 'en'
     ? `${dirCount ? dirCount + ' folder(s) · ' : ''}${data.files.length} file(s) · ${humanSize(data.total_size)}`
     : `${dirCount ? dirCount + ' 个文件夹 · ' : ''}${data.files.length} 个文件 · 合计 ${humanSize(data.total_size)}`;
+  updateFileSelectionUI();
+}
+
+/* ------------------------------------------------------------------ 文件勾选与媒体任务 */
+function updateFileSelectionUI() {
+  const count = S.fileSelected.size;
+  const info = $('#fileSelectedInfo');
+  if (info) info.textContent = count ? (S.lang === 'en' ? `· ${count} selected` : `· 已选 ${count} 个`) : '';
+  const all = $('#fileCheckAll');
+  if (all) {
+    const visible = (S.files && S.files.files) ? S.files.files.length : 0;
+    all.checked = visible > 0 && count >= visible;
+    all.indeterminate = count > 0 && !all.checked;
+  }
+  const mergeBtn = $('#btnMergeFiles');
+  if (mergeBtn) mergeBtn.disabled = count < 2;
+  const cropBtn = $('#btnTo169');
+  if (cropBtn) cropBtn.disabled = count < 1;
+}
+
+function selectedFilePaths() {
+  return Array.from(S.fileSelected);
+}
+
+async function startMergeSelected() {
+  const paths = selectedFilePaths();
+  if (paths.length < 2) { toast(t('needTwoFiles'), 'warn'); return; }
+  if (!await confirmDialog(t('confirmMerge', { n: paths.length }))) return;
+  try {
+    const result = await api('/api/media/merge', { method: 'POST', body: { paths } });
+    S.jobsHidden = false;
+    toast(t('mergeStarted'), 'ok');
+    if (result.job) renderJobs([result.job]);
+    pollJobs(true);
+  } catch (err) { toast(err.message, 'err'); }
+}
+
+async function startTo169() {
+  const paths = selectedFilePaths();
+  if (!paths.length) { toast(t('nothingSelected'), 'warn'); return; }
+  if (!await confirmDialog(t('confirmTo169', { n: paths.length }))) return;
+  try {
+    const result = await api('/api/media/to16x9', { method: 'POST', body: { paths } });
+    S.jobsHidden = false;
+    toast(t('convertStarted', { n: result.count || paths.length }), 'ok');
+    pollJobs(true);
+  } catch (err) { toast(err.message, 'err'); }
+}
+
+const JOB_LABELS = {
+  queued: 'jobQueued', running: 'jobRunning', done: 'jobDone', error: 'jobError', cancelled: 'jobCancelled',
+};
+const JOB_TAG_CLASS = { done: 'ok', error: 'err', cancelled: 'warn' };
+
+function renderJobs(items) {
+  const card = $('#mediaJobsCard');
+  const box = $('#mediaJobs');
+  if (!card || !box) return;
+  S.mediaJobs = items || [];
+  if (!S.mediaJobs.length) { card.classList.add('hidden'); return; }
+  if (S.jobsHidden) { card.classList.add('hidden'); } else { card.classList.remove('hidden'); }
+
+  const active = S.mediaJobs.filter((j) => j.running).length;
+  const hint = $('#mediaJobsHint');
+  if (hint) hint.textContent = active ? t('jobsRunningHint', { n: active }) : '';
+
+  box.innerHTML = S.mediaJobs.map((job) => {
+    const label = t(JOB_LABELS[job.status] || job.status);
+    const tagClass = JOB_TAG_CLASS[job.status] || '';
+    const percent = job.status === 'done' ? 100 : Math.max(0, Math.min(100, job.percent || 0));
+    const result = job.result || {};
+    let detail = '';
+    if (job.error) {
+      detail = `<div class="job-detail err-text">${esc(job.error)}</div>`;
+    } else if (result.output) {
+      const badge = result.lossless ? t('losslessBadge') : t('reencodedBadge');
+      detail = `<div class="job-detail">${esc(result.name || '')} · ${humanSize(result.size || 0)} · ${badge}</div>`;
+    }
+    const cancel = job.running
+      ? `<button class="btn tiny danger job-cancel" data-id="${esc(job.id)}">${t('cancelJob')}</button>` : '';
+    return `<div class="job-row">
+      <div class="job-head"><strong>${esc(job.title)}</strong><span class="tag ${tagClass}">${label}</span></div>
+      <div class="job-bar"><span style="width:${percent}%"></span></div>
+      <div class="job-foot"><span class="muted">${esc(job.message || '')}</span>${cancel}</div>
+      ${detail}
+    </div>`;
+  }).join('');
+}
+
+async function pollJobs(force) {
+  if (S.jobsBusy) return;              // 防止快速连点造成并发请求
+  if (S.jobsTimer) { clearTimeout(S.jobsTimer); S.jobsTimer = null; }
+  S.jobsBusy = true;
+  try {
+    const data = await api('/api/media/jobs?limit=20');
+    renderJobs(data.items || []);
+    const active = data.active || 0;
+    if (active > 0) {
+      S.jobsWasActive = true;
+      S.jobsTimer = setTimeout(() => { S.jobsTimer = null; pollJobs(false); }, 1500);
+    } else if (S.jobsWasActive) {
+      // 从「有任务」变成「全部结束」时刷新一次文件列表，让新文件立刻出现
+      S.jobsWasActive = false;
+      if (S.page === 'files') loadFiles(S.filePath, true);
+    }
+  } catch (err) {
+    S.jobsTimer = null;
+  } finally {
+    S.jobsBusy = false;
+  }
 }
 
 /* ------------------------------------------------------------------ 事件绑定 */
@@ -1168,6 +1312,25 @@ function bindEvents() {
   // 文件页
   $('#btnUp').onclick = () => { if (S.files && S.files.parent) loadFiles(S.files.parent); };
   $('#btnRefreshFiles').onclick = () => loadFiles(S.filePath);
+  $('#btnMergeFiles').onclick = startMergeSelected;
+  $('#btnTo169').onclick = startTo169;
+  $('#btnHideJobs').onclick = () => {
+    S.jobsHidden = true;
+    $('#mediaJobsCard').classList.add('hidden');
+  };
+  $('#fileCheckAll').addEventListener('change', (ev) => {
+    if (!S.files || !S.files.files) return;
+    if (ev.target.checked) S.files.files.forEach((f) => S.fileSelected.add(f.path));
+    else S.fileSelected.clear();
+    renderFiles();
+  });
+  $('#fileTbody').addEventListener('change', (ev) => {
+    const el = ev.target;
+    if (!el.classList.contains('file-check')) return;
+    if (el.checked) S.fileSelected.add(el.dataset.path);
+    else S.fileSelected.delete(el.dataset.path);
+    updateFileSelectionUI();
+  });
   $('#btnGoRoot').onclick = () => {
     const root = (S.files && (S.files.root || (S.files.roots && S.files.roots[0]))) || '';
     if (root) loadFiles(root);
@@ -1203,6 +1366,15 @@ function bindEvents() {
   $('#filePath').addEventListener('click', (ev) => {
     const btn = ev.target.closest('button');
     if (btn && btn.dataset.path) loadFiles(btn.dataset.path);
+  });
+  $('#mediaJobs').addEventListener('click', async (ev) => {
+    const btn = ev.target.closest('.job-cancel');
+    if (!btn) return;
+    try {
+      await api('/api/media/jobs/cancel', { method: 'POST', body: { id: btn.dataset.id } });
+      toast(S.lang === 'en' ? 'Cancelling…' : '正在取消…', 'ok');
+      pollJobs(true);
+    } catch (err) { toast(err.message, 'err'); }
   });
 }
 
@@ -1240,6 +1412,7 @@ async function init() {
 
   setInterval(() => { if (S.page === 'dashboard') refreshState(); }, 5000);
   setInterval(() => { if (S.page === 'urls') loadUrls(); }, 30000);
+  pollJobs(true);   // 刷新页面后继续跟踪仍在跑的后处理任务
   S.initialising = false;
 }
 
