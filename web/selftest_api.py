@@ -210,6 +210,44 @@ def main():
             check('  输出为 640x360',
                   (info['video']['width'], info['video']['height']) == (640, 360),
                   f"{info['video']['width']}x{info['video']['height']}")
+
+        # 压缩：档位元数据 + 参数校验 + 真实跑一次
+        r = get('/api/media/presets')
+        presets = r.json()
+        check('GET /api/media/presets', r.status_code == 200
+              and [c['id'] for c in presets.get('codecs', [])] == ['h264', 'av1'])
+        check('  返回耗时预估', all(c.get('minutes_per_source_hour')
+                                for c in presets.get('codecs', [])))
+
+        r = post('/api/media/compress', {'paths': [clip], 'codec': 'vp9'})
+        check('compress 非法编码器被拒绝(400)', r.status_code == 400,
+              str(r.json().get('error'))[:50])
+        r = post('/api/media/compress', {'paths': [clip], 'codec': 'h264', 'tier': 'ultra'})
+        check('compress 非法档位被拒绝(400)', r.status_code == 400,
+              str(r.json().get('error'))[:50])
+
+        r = post('/api/media/compress', {'paths': [clip], 'codec': 'h264',
+                                         'tier': 'small', 'crop_to_16x9': True})
+        jobs = r.json().get('jobs') or [{}]
+        cjob_id = jobs[0].get('id', '')
+        check('compress 已入队', r.status_code == 200 and bool(cjob_id))
+        cjob = {}
+        for _ in range(120):
+            time.sleep(0.5)
+            items = get('/api/media/jobs').json().get('items', [])
+            cjob = next((i for i in items if i.get('id') == cjob_id), {})
+            if cjob.get('status') in ('done', 'error', 'cancelled'):
+                break
+        check('  压缩任务完成', cjob.get('status') == 'done', str(cjob.get('error'))[:80])
+        cresult = cjob.get('result') or {}
+        check('  输出体积小于源', (cresult.get('size') or 0) < (cresult.get('source_size') or 1),
+              f"{cresult.get('source_size')} -> {cresult.get('size')}")
+        if cresult.get('output'):
+            cinfo = mt.probe(cresult['output'])
+            check('  输出编码为 h264', cinfo['video']['codec'] == 'h264', cinfo['video']['codec'])
+            check('  顺带裁成 640x360',
+                  (cinfo['video']['width'], cinfo['video']['height']) == (640, 360),
+                  f"{cinfo['video']['width']}x{cinfo['video']['height']}")
     except Exception as exc:  # noqa: BLE001
         check('媒体端到端测试', False, str(exc)[:120])
     finally:

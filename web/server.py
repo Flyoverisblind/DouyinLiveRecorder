@@ -823,6 +823,57 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 jobs.append(job.to_dict())
             return self._json({'ok': True, 'jobs': jobs, 'count': len(jobs)})
 
+        # ---------------- 压缩转码（H.264 / AV1）
+        if route == '/api/media/presets' and method == 'GET':
+            return self._json({
+                'ok': True,
+                **media_tools.presets_info(),
+                'av1_available': media_tools.is_av1_supported(app.project_root),
+            })
+
+        if route == '/api/media/compress' and method == 'POST':
+            payload = body()
+            targets = [p for p in (payload.get('paths') or []) if p]
+            if not targets:
+                raise ApiError('请先选择要压缩的文件')
+            codec = (payload.get('codec') or 'h264').lower()
+            tier = (payload.get('tier') or 'balanced').lower()
+            if codec not in media_tools.QUALITY_TIERS:
+                raise ApiError(f'不支持的编码器: {codec}')
+            if tier not in media_tools.QUALITY_TIERS[codec]:
+                raise ApiError(f'不支持的画质档位: {tier}')
+            if codec == 'av1' and not media_tools.is_av1_supported(app.project_root):
+                raise ApiError('当前 ffmpeg 不包含 AV1 编码器（libsvtav1），请升级 ffmpeg')
+            crop_to_16x9 = payload.get('crop_to_16x9', True) is not False
+            allow_content_loss = bool(payload.get('allow_content_loss', False))
+            out_dir = payload.get('out_dir') or None
+            if out_dir and not os.path.isdir(out_dir):
+                raise ApiError(f'输出目录不存在: {out_dir}')
+
+            for target in targets:
+                if not os.path.isfile(target):
+                    raise ApiError(f'文件不存在: {target}')
+                try:
+                    media_tools.probe(target, app.project_root)
+                except media_tools.MediaError as exc:
+                    raise ApiError(str(exc)) from exc
+
+            jobs = []
+            for target in targets:
+
+                def _run_compress(job, target=target, codec=codec, tier=tier,
+                                  crop_to_16x9=crop_to_16x9, allow=allow_content_loss):
+                    return media_tools.compress(
+                        target, app.project_root, out_dir=out_dir, job=job,
+                        codec=codec, tier=tier, crop_to_16x9=crop_to_16x9,
+                        allow_content_loss=allow)
+
+                job = app.media_jobs.start(
+                    'compress', f'压缩（{codec.upper()}）：{os.path.basename(target)}',
+                    _run_compress, payload={'path': target})
+                jobs.append(job.to_dict())
+            return self._json({'ok': True, 'jobs': jobs, 'count': len(jobs)})
+
         if route == '/api/media/jobs' and method == 'GET':
             return self._json({
                 'ok': True,

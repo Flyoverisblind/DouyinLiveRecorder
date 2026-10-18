@@ -93,6 +93,15 @@ const I18N = {
     jobQueued: '排队中', jobRunning: '处理中', jobDone: '已完成', jobError: '失败', jobCancelled: '已取消',
     cancelJob: '取消', losslessBadge: '无损', reencodedBadge: '已重编码',
     jobsRunningHint: '{n} 个任务进行中',
+    compress: '压缩', compressTitle: '压缩视频',
+    compressIntro: '压缩是重新编码：体积会明显变小，但画面会再经历一次有损压缩。要无损请用「转为16:9」。',
+    codecLabel: '编码器', tierLabel: '画质档位', startCompress: '开始压缩',
+    cropAuto: '自动裁掉黑边并转为 16:9（没有黑边会自动跳过）',
+    compressPerHour: '每 1 小时录像约需 {time}',
+    av1SlowWarning: 'AV1 体积更小，但编码很慢，旧手机/电视可能打不开。',
+    av1Unavailable: '当前 ffmpeg 不支持 AV1（缺少 libsvtav1）',
+    compressStarted: '已加入 {n} 个压缩任务',
+    savedPct: '省 {n}%',
   },
   en: {
     appName: 'Live Recorder Console', navDashboard: 'Overview', navUrls: 'Stream URLs',
@@ -141,6 +150,15 @@ const I18N = {
     jobQueued: 'Queued', jobRunning: 'Running', jobDone: 'Done', jobError: 'Failed', jobCancelled: 'Cancelled',
     cancelJob: 'Cancel', losslessBadge: 'lossless', reencodedBadge: 're-encoded',
     jobsRunningHint: '{n} task(s) running',
+    compress: 'Compress', compressTitle: 'Compress video',
+    compressIntro: 'Compressing re-encodes the video: the file gets much smaller, but the picture goes through one more lossy pass. Use "To 16:9" if you need lossless.',
+    codecLabel: 'Codec', tierLabel: 'Quality', startCompress: 'Start',
+    cropAuto: 'Also crop black bars to 16:9 (skipped when there are none)',
+    compressPerHour: 'About {time} per hour of source video',
+    av1SlowWarning: 'AV1 is smaller but much slower, and older phones/TVs may not play it.',
+    av1Unavailable: 'This ffmpeg build has no AV1 encoder (libsvtav1)',
+    compressStarted: 'Queued {n} compression task(s)',
+    savedPct: 'saved {n}%',
   },
 };
 
@@ -1031,6 +1049,8 @@ function updateFileSelectionUI() {
   if (mergeBtn) mergeBtn.disabled = count < 2;
   const cropBtn = $('#btnTo169');
   if (cropBtn) cropBtn.disabled = count < 1;
+  const compressBtn = $('#btnCompress');
+  if (compressBtn) compressBtn.disabled = count < 1;
 }
 
 function selectedFilePaths() {
@@ -1062,6 +1082,98 @@ async function startTo169() {
   } catch (err) { toast(err.message, 'err'); }
 }
 
+/* 压缩：选编码器 + 画质档位，长任务在后台跑 */
+function humanDuration(minutes) {
+  const total = Math.round(minutes || 0);
+  if (total < 60) return S.lang === 'en' ? `${total} min` : `${total} 分钟`;
+  const hours = Math.floor(total / 60);
+  const rest = total % 60;
+  return S.lang === 'en' ? `${hours} h ${rest} min` : `${hours} 小时 ${rest} 分`;
+}
+
+async function compressSelected() {
+  const paths = selectedFilePaths();
+  if (!paths.length) { toast(t('nothingSelected'), 'warn'); return; }
+  let presets;
+  try { presets = await api('/api/media/presets'); } catch (err) { toast(err.message, 'err'); return; }
+
+  const codecs = presets.codecs || [];
+  if (!codecs.length) { toast(S.lang === 'en' ? 'No encoder available' : '没有可用的编码器', 'err'); return; }
+
+  const codecOptions = codecs.map((c) => {
+    const disabled = c.id === 'av1' && !presets.av1_available;
+    return `<option value="${esc(c.id)}"${disabled ? ' disabled' : ''}>${esc(c.label)}${
+      disabled ? ` — ${esc(t('av1Unavailable'))}` : ''}</option>`;
+  }).join('');
+
+  openModal(t('compressTitle'), `
+    <div class="alert info" style="margin-bottom:12px">${esc(t('compressIntro'))}</div>
+    <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:12px">
+      <div style="flex:1 1 240px">
+        <label class="muted" style="font-size:12px">${esc(t('codecLabel'))}</label>
+        <select class="select" id="cmpCodec" style="width:100%">${codecOptions}</select>
+      </div>
+      <div style="flex:1 1 240px">
+        <label class="muted" style="font-size:12px">${esc(t('tierLabel'))}</label>
+        <select class="select" id="cmpTier" style="width:100%"></select>
+      </div>
+    </div>
+    <div id="cmpNote" class="muted" style="margin-bottom:10px"></div>
+    <div id="cmpWarn" class="alert warn hidden" style="margin-bottom:10px">${esc(t('av1SlowWarning'))}</div>
+    <label class="inline-check"><input type="checkbox" id="cmpCrop" checked> ${esc(t('cropAuto'))}</label>`,
+    `<button class="btn ghost" id="cmpCancel">${S.lang === 'en' ? 'Cancel' : '取消'}</button>
+     <button class="btn primary" id="cmpStart">${esc(t('startCompress'))}</button>`);
+
+  const codecSel = $('#cmpCodec');
+  const tierSel = $('#cmpTier');
+  const note = $('#cmpNote');
+  const warn = $('#cmpWarn');
+
+  const currentCodec = () => codecs.find((c) => c.id === codecSel.value) || codecs[0];
+
+  function refreshTiers() {
+    const codec = currentCodec();
+    tierSel.innerHTML = (codec.tiers || []).map((x) => {
+      const selected = x.id === 'balanced' ? ' selected' : '';
+      return `<option value="${esc(x.id)}"${selected}>${esc(x.label)} — ${esc(x.note)}</option>`;
+    }).join('');
+    refreshNote();
+  }
+
+  function refreshNote() {
+    const codec = currentCodec();
+    const tier = (codec.tiers || []).find((x) => x.id === tierSel.value) || {};
+    const parts = [];
+    if (tier.note) parts.push(tier.note);
+    if (codec.minutes_per_source_hour) {
+      parts.push(t('compressPerHour', { time: humanDuration(codec.minutes_per_source_hour) }));
+    }
+    note.textContent = parts.join(' · ');
+    warn.classList.toggle('hidden', codec.id !== 'av1');
+  }
+
+  codecSel.onchange = refreshTiers;
+  tierSel.onchange = refreshNote;
+  refreshTiers();
+
+  $('#cmpCancel').onclick = closeModal;
+  $('#cmpStart').onclick = async () => {
+    const codec = codecSel.value;
+    const tier = tierSel.value;
+    const cropOn = $('#cmpCrop').checked;
+    try {
+      const result = await api('/api/media/compress', {
+        method: 'POST',
+        body: { paths, codec, tier, crop_to_16x9: cropOn },
+      });
+      closeModal();
+      S.jobsHidden = false;
+      toast(t('compressStarted', { n: result.count || paths.length }), 'ok');
+      pollJobs(true);
+    } catch (err) { toast(err.message, 'err'); }
+  };
+}
+
 const JOB_LABELS = {
   queued: 'jobQueued', running: 'jobRunning', done: 'jobDone', error: 'jobError', cancelled: 'jobCancelled',
 };
@@ -1089,7 +1201,16 @@ function renderJobs(items) {
       detail = `<div class="job-detail err-text">${esc(job.error)}</div>`;
     } else if (result.output) {
       const badge = result.lossless ? t('losslessBadge') : t('reencodedBadge');
-      detail = `<div class="job-detail">${esc(result.name || '')} · ${humanSize(result.size || 0)} · ${badge}</div>`;
+      let info;
+      if (typeof result.saved_ratio === 'number' && result.source_size) {
+        // 压缩任务最该看到的就是「省了多少」，直接前后对比
+        const pct = Math.round(result.saved_ratio * 100);
+        info = `${esc(result.name || '')} · ${humanSize(result.source_size)} → `
+          + `${humanSize(result.size || 0)} · ${t('savedPct', { n: pct })}`;
+      } else {
+        info = `${esc(result.name || '')} · ${humanSize(result.size || 0)} · ${badge}`;
+      }
+      detail = `<div class="job-detail">${info}</div>`;
     }
     const cancel = job.running
       ? `<button class="btn tiny danger job-cancel" data-id="${esc(job.id)}">${t('cancelJob')}</button>` : '';
@@ -1314,6 +1435,7 @@ function bindEvents() {
   $('#btnRefreshFiles').onclick = () => loadFiles(S.filePath);
   $('#btnMergeFiles').onclick = startMergeSelected;
   $('#btnTo169').onclick = startTo169;
+  $('#btnCompress').onclick = compressSelected;
   $('#btnHideJobs').onclick = () => {
     S.jobsHidden = true;
     $('#mediaJobsCard').classList.add('hidden');

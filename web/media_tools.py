@@ -81,6 +81,18 @@ def even(value) -> int:
     return int(round(float(value) / 2.0)) * 2
 
 
+def format_duration(seconds: float) -> str:
+    """把秒数变成「1 小时 23 分 / 45 秒」这种给人看的文字。"""
+    total = max(0, int(seconds))
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f'{hours} 小时 {minutes} 分'
+    if minutes:
+        return f'{minutes} 分 {secs} 秒'
+    return f'{secs} 秒'
+
+
 # ---------------------------------------------------------------- 可执行文件
 
 def _project_root(project_root: str = None) -> str:
@@ -565,6 +577,7 @@ def _run_with_progress(cmd: list, total_duration: float, job=None, timeout: int 
 
     tail = []
     started = time.time()
+    speed = 0.0
     try:
         for line in process.stdout:
             line = line.strip()
@@ -576,9 +589,20 @@ def _run_with_progress(cmd: list, total_duration: float, job=None, timeout: int 
                 except ValueError:
                     continue
                 if total_duration > 0:
-                    _job_update(job, min(99.0, max(0.0, elapsed / total_duration * 100.0)))
+                    percent = min(99.0, max(0.0, elapsed / total_duration * 100.0))
+                    # 长任务（AV1 可能要好几小时）必须让用户看到还要等多久
+                    if speed > 0 and total_duration > elapsed:
+                        remain = (total_duration - elapsed) / speed
+                        _job_update(job, percent,
+                                    f'已处理 {percent:.0f}%，剩余约 {format_duration(remain)}')
+                    else:
+                        _job_update(job, percent)
             elif line.startswith('speed='):
-                pass
+                raw = line.split('=', 1)[1].strip().rstrip('x')
+                try:
+                    speed = float(raw)
+                except ValueError:
+                    speed = 0.0
             elif '=' not in line:
                 tail.append(line)
                 del tail[:-40]
@@ -869,6 +893,175 @@ def to_16x9(path: str, project_root: str = None, out_dir: str = None, job=None,
         except OSError as exc:
             result['remove_errors'] = [str(exc)]
     return result
+
+
+# ---------------------------------------------------------------- 压缩转码
+
+# 画质档位 -> 编码参数。数值来自在本机（i5-12400F）对真实录制素材的实测：
+#   H.264 CRF16 8.71Mbps SSIM .9923 / CRF20 5.28Mbps .9876
+#   AV1  p6 CRF34 4.30Mbps .9891 / p4 CRF32 4.99Mbps .9910
+# 注意：SVT-AV1 官方警告 preset>=10 是给自动化工具用的、可能出现画质问题，
+# 所以这里统一用 preset 6，宁可慢也不踩那个坑。
+QUALITY_TIERS = {
+    'h264': {
+        'high': {'codec': 'libx264', 'preset': 'veryfast', 'crf': 18,
+                 'label': '高质量', 'note': '接近原片，速度快，任何设备都能播'},
+        'balanced': {'codec': 'libx264', 'preset': 'veryfast', 'crf': 21,
+                     'label': '均衡', 'note': '体积约减半，肉眼几乎看不出差别'},
+        'small': {'codec': 'libx264', 'preset': 'veryfast', 'crf': 24,
+                  'label': '小体积', 'note': '体积最小，快速运动的画面可能有细微损失'},
+    },
+    'av1': {
+        'high': {'codec': 'libsvtav1', 'preset': 6, 'crf': 28,
+                 'label': '高质量', 'note': '比同档 H.264 更小，但很慢'},
+        'balanced': {'codec': 'libsvtav1', 'preset': 6, 'crf': 32,
+                     'label': '均衡', 'note': '体积与 H.264 均衡档相近，画质略好'},
+        'small': {'codec': 'libsvtav1', 'preset': 6, 'crf': 36,
+                  'label': '小体积', 'note': '体积最小，老设备可能不支持 AV1'},
+    },
+}
+
+# 本机实测编码速度（1080p60，帧/秒），只用于界面上的耗时预估
+ENCODE_SPEED_HINT = {'h264': 150.0, 'av1': 41.0}
+
+CODEC_LABELS = {
+    'h264': 'H.264（快，兼容所有播放器）',
+    'av1': 'AV1（体积更小，很慢，老设备可能不支持）',
+}
+
+
+def presets_info() -> dict:
+    """给前端用的档位与耗时预估。速度按 1080p60 实测折算。"""
+    frames_per_source_hour = 3600 * 60
+    codecs = []
+    for codec, tiers in QUALITY_TIERS.items():
+        speed = ENCODE_SPEED_HINT.get(codec) or 0
+        codecs.append({
+            'id': codec,
+            'label': CODEC_LABELS.get(codec, codec),
+            'speed_fps': speed,
+            'minutes_per_source_hour': round(frames_per_source_hour / speed / 60, 1) if speed else None,
+            'tiers': [dict(id=tier_id, **meta) for tier_id, meta in tiers.items()],
+        })
+    return {'codecs': codecs}
+
+
+def compress(path: str, project_root: str = None, out_dir: str = None, job=None,
+             codec: str = 'h264', tier: str = 'balanced', crop_to_16x9: bool = True,
+             drop_source: bool = False, output: str = None,
+             allow_content_loss: bool = False) -> dict:
+    """把视频重编码成更小的 MP4，可选在同一趟里裁掉黑边转 16:9。
+
+    与「转为16:9」不同，这个是真重编码，所以体积会明显下降，但画面会经过一次
+    有损压缩；H.264 很快，AV1 很慢（一个 4 小时录像可能要 6 小时以上）。
+    """
+    codec = (codec or 'h264').lower()
+    tier = (tier or 'balanced').lower()
+    if codec not in QUALITY_TIERS:
+        raise MediaError(f'不支持的编码器: {codec}')
+    if tier not in QUALITY_TIERS[codec]:
+        raise MediaError(f'不支持的画质档位: {tier}')
+
+    path = os.path.abspath(path)
+    if not os.path.isfile(path):
+        raise MediaError(f'文件不存在: {path}')
+    info = probe(path, project_root)
+    settings = QUALITY_TIERS[codec][tier]
+
+    # 顺便处理黑边：既然要重编码，裁掉黑边是免费的
+    crop = None
+    warnings = []
+    if crop_to_16x9:
+        _job_update(job, 1.0, '正在检测黑边')
+        box = detect_content_box(path, info['duration'], project_root=project_root)
+        if box.get('ok'):
+            plan = plan_to16x9(info, box)
+            action = plan.get('action')
+            if action == 'crop':
+                crop = plan['crop']
+                warnings.extend(plan.get('warnings') or [])
+            elif action == 'blocked' and allow_content_loss:
+                crop = frame_16x9_crop(info['video']['width'], info['video']['height'])
+                warnings.append('按 16:9 裁切会切掉部分画面（你已允许）')
+            elif action == 'blocked':
+                warnings.append(f'未裁边：{plan.get("reason")}')
+        else:
+            warnings.append(f'未裁边：{box.get("reason")}')
+
+    suffix = 'AV1' if codec == 'av1' else '压缩'
+    output = os.path.abspath(output) if output else derive_output_path([path], suffix, out_dir=out_dir)
+    _job_output(job, output)
+    if os.path.exists(output):
+        raise MediaError(f'输出文件已存在: {output}')
+
+    filters = []
+    if crop:
+        filters.append(f"crop={crop['width']}:{crop['height']}:{crop['x']}:{crop['y']}")
+    filters.append('format=yuv420p')
+
+    audio = info.get('audio')
+    if audio and audio.get('codec') == 'aac':
+        audio_args = ['-c:a', 'copy']
+    elif audio:
+        audio_args = ['-c:a', 'aac', '-b:a', '192k']
+    else:
+        audio_args = ['-an']
+
+    ffmpeg = find_ffmpeg(project_root)
+    cmd = [
+        ffmpeg, '-hide_banner', '-y', '-nostdin', '-i', path,
+        '-map', '0:v:0', '-map', '0:a:0?',
+        '-vf', ','.join(filters),
+        '-c:v', settings['codec'],
+        '-preset', str(settings['preset']),
+        '-crf', str(settings['crf']),
+        '-pix_fmt', 'yuv420p',
+        '-fps_mode', 'passthrough',
+    ] + audio_args + [
+        '-map_metadata', '0',
+        '-movflags', '+faststart',
+        '-progress', 'pipe:1', '-nostats',
+        output,
+    ]
+
+    label = 'AV1' if codec == 'av1' else 'H.264'
+    _job_update(job, 2.0, f'开始用 {label} 重编码（{settings["label"]}）')
+    _run_with_progress(cmd, info['duration'], job)
+
+    if not os.path.exists(output):
+        raise MediaError('压缩失败：未生成输出文件')
+
+    size = os.path.getsize(output)
+    source_size = info['size']
+    return {
+        'output': output,
+        'name': os.path.basename(output),
+        'size': size,
+        'source': path,
+        'source_size': source_size,
+        'codec': codec,
+        'codec_label': label,
+        'tier': tier,
+        'tier_label': settings['label'],
+        'crf': settings['crf'],
+        'preset': settings['preset'],
+        'lossless': False,
+        'saved_bytes': source_size - size,
+        'saved_ratio': round(1 - size / source_size, 4) if source_size else 0,
+        'crop': crop,
+        'duration': info['duration'],
+        'warnings': warnings,
+    }
+
+
+def is_av1_supported(project_root: str = None) -> bool:
+    """确认当前 ffmpeg 是否带 AV1 编码器。"""
+    try:
+        ffmpeg = find_ffmpeg(project_root)
+    except MediaError:
+        return False
+    result = _run([ffmpeg, '-hide_banner', '-encoders'], timeout=30)
+    return 'libsvtav1' in (result.stdout or '')
 
 
 # ---------------------------------------------------------------- 便捷判断

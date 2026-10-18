@@ -63,6 +63,24 @@ def test_pure():
             fallback_detail.append(f'{width}x{height}->{crop}')
     check('兜底裁剪结果始终是严格 16:9 且不越界', fallback_ok, '; '.join(fallback_detail))
 
+    # 压缩档位元数据
+    presets = mt.presets_info()
+    codec_ids = [c['id'] for c in presets['codecs']]
+    check('压缩档位含 h264 / av1', codec_ids == ['h264', 'av1'], str(codec_ids))
+    h264_tiers = next(c for c in presets['codecs'] if c['id'] == 'h264')['tiers']
+    check('每档都有 crf/preset/说明',
+          all(t.get('crf') is not None and t.get('preset') not in (None, '') and t.get('note')
+              for t in h264_tiers), str([t['id'] for t in h264_tiers]))
+    av1_tiers = next(c for c in presets['codecs'] if c['id'] == 'av1')['tiers']
+    check('AV1 不使用 preset>=10（SVT 官方警告该档位不保证画质）',
+          all(int(t['preset']) < 10 for t in av1_tiers), str([t['preset'] for t in av1_tiers]))
+    check('耗时预估都是正数',
+          all(c['minutes_per_source_hour'] and c['minutes_per_source_hour'] > 0
+              for c in presets['codecs']))
+    check('AV1 预估耗时比 H.264 长',
+          next(c for c in presets['codecs'] if c['id'] == 'av1')['minutes_per_source_hour']
+          > next(c for c in presets['codecs'] if c['id'] == 'h264')['minutes_per_source_hour'])
+
     # 1920x1810、内容占顶部 1078 行 —— 与真实案例一致的场景
     info = {'path': 'x', 'name': 'x.mp4', 'size': 1, 'mtime': 0, 'duration': 10,
             'video': {'codec': 'h264', 'width': 1920, 'height': 1810, 'pix_fmt': 'yuv420p',
@@ -231,6 +249,38 @@ def test_integration():
             check('单文件被拒绝合并', False, '没有抛错')
         except mt.MediaError as exc:
             check('单文件被拒绝合并', '2' in str(exc), str(exc)[:50])
+
+        # --- 压缩转码（H.264 / AV1）
+        for codec, tier in (('h264', 'balanced'), ('av1', 'small')):
+            if codec == 'av1' and not mt.is_av1_supported():
+                print('    [跳过] 当前 ffmpeg 不支持 AV1')
+                continue
+            small = os.path.join(tmp, f'cmp_{codec}.mp4')
+            made = _make_clip(ffmpeg, small, 320, 180, 180, seconds=2)
+            if made.returncode != 0:
+                check(f'压缩({codec}) 生成素材', False, (made.stderr or '')[-150:])
+                continue
+            result = mt.compress(small, codec=codec, tier=tier, crop_to_16x9=True)
+            out_info = mt.probe(result['output'])
+            expect = 'av1' if codec == 'av1' else 'h264'
+            check(f'压缩({codec}) 输出编码正确', out_info['video']['codec'] == expect,
+                  out_info['video']['codec'])
+            check(f'压缩({codec}) 分辨率不变（无黑边时不裁）',
+                  (out_info['video']['width'], out_info['video']['height']) == (320, 180),
+                  f"{out_info['video']['width']}x{out_info['video']['height']}")
+            check(f'压缩({codec}) 音轨保留', out_info.get('audio') is not None,
+                  str(out_info.get('audio')))
+            check(f'压缩({codec}) 有体积对比数据',
+                  isinstance(result.get('saved_ratio'), float),
+                  f"src={result['source_size']} out={result['size']}")
+
+        # --- 非法编码器 / 档位必须拒绝
+        for bad in ({'codec': 'vp9'}, {'codec': 'h264', 'tier': 'ultra'}):
+            try:
+                mt.compress(clips[0], **bad)
+                check(f'非法参数 {bad} 被拒绝', False, '没有抛错')
+            except mt.MediaError as exc:
+                check(f'非法参数 {bad} 被拒绝', '不支持' in str(exc), str(exc)[:50])
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
