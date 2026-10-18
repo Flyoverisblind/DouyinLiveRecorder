@@ -95,7 +95,10 @@ const I18N = {
     jobsRunningHint: '{n} 个任务进行中',
     compress: '压缩', compressTitle: '压缩视频',
     compressIntro: '压缩是重新编码：体积会明显变小，但画面会再经历一次有损压缩。要无损请用「转为16:9」。',
-    codecLabel: '编码器', tierLabel: '画质档位', startCompress: '开始压缩',
+    codecLabel: '编码器', tierLabel: '压缩强度', startCompress: '开始压缩',
+    estimating: '正在估算体积…',
+    estimateLine: '预计 {from} → {to}（省 {pct}%）',
+    estimateFail: '无法预估体积（缺少码率信息）',
     cropAuto: '自动裁掉黑边并转为 16:9（没有黑边会自动跳过）',
     compressPerHour: '每 1 小时录像约需 {time}',
     av1SlowWarning: 'AV1 体积更小，但编码很慢，旧手机/电视可能打不开。',
@@ -152,7 +155,10 @@ const I18N = {
     jobsRunningHint: '{n} task(s) running',
     compress: 'Compress', compressTitle: 'Compress video',
     compressIntro: 'Compressing re-encodes the video: the file gets much smaller, but the picture goes through one more lossy pass. Use "To 16:9" if you need lossless.',
-    codecLabel: 'Codec', tierLabel: 'Quality', startCompress: 'Start',
+    codecLabel: 'Codec', tierLabel: 'Strength', startCompress: 'Start',
+    estimating: 'Estimating size…',
+    estimateLine: 'Estimated {from} → {to} (save {pct}%)',
+    estimateFail: 'Cannot estimate size (no bitrate info)',
     cropAuto: 'Also crop black bars to 16:9 (skipped when there are none)',
     compressPerHour: 'About {time} per hour of source video',
     av1SlowWarning: 'AV1 is smaller but much slower, and older phones/TVs may not play it.',
@@ -1098,13 +1104,18 @@ async function compressSelected() {
   try { presets = await api('/api/media/presets'); } catch (err) { toast(err.message, 'err'); return; }
 
   const codecs = presets.codecs || [];
-  if (!codecs.length) { toast(S.lang === 'en' ? 'No encoder available' : '没有可用的编码器', 'err'); return; }
+  const levels = presets.levels || [];
+  if (!codecs.length || !levels.length) {
+    toast(S.lang === 'en' ? 'No encoder available' : '没有可用的编码器', 'err'); return;
+  }
 
   const codecOptions = codecs.map((c) => {
     const disabled = c.id === 'av1' && !presets.av1_available;
     return `<option value="${esc(c.id)}"${disabled ? ' disabled' : ''}>${esc(c.label)}${
       disabled ? ` — ${esc(t('av1Unavailable'))}` : ''}</option>`;
   }).join('');
+  const levelOptions = levels.map((x) =>
+    `<option value="${esc(x.id)}"${x.id === 'medium' ? ' selected' : ''}>${esc(x.label)} — ${esc(x.note)}</option>`).join('');
 
   openModal(t('compressTitle'), `
     <div class="alert info" style="margin-bottom:12px">${esc(t('compressIntro'))}</div>
@@ -1115,9 +1126,10 @@ async function compressSelected() {
       </div>
       <div style="flex:1 1 240px">
         <label class="muted" style="font-size:12px">${esc(t('tierLabel'))}</label>
-        <select class="select" id="cmpTier" style="width:100%"></select>
+        <select class="select" id="cmpLevel" style="width:100%">${levelOptions}</select>
       </div>
     </div>
+    <div id="cmpEstimate" class="alert info" style="margin-bottom:10px">${esc(t('estimating'))}</div>
     <div id="cmpNote" class="muted" style="margin-bottom:10px"></div>
     <div id="cmpWarn" class="alert warn hidden" style="margin-bottom:10px">${esc(t('av1SlowWarning'))}</div>
     <label class="inline-check"><input type="checkbox" id="cmpCrop" checked> ${esc(t('cropAuto'))}</label>`,
@@ -1125,46 +1137,64 @@ async function compressSelected() {
      <button class="btn primary" id="cmpStart">${esc(t('startCompress'))}</button>`);
 
   const codecSel = $('#cmpCodec');
-  const tierSel = $('#cmpTier');
+  const levelSel = $('#cmpLevel');
+  const estimateBox = $('#cmpEstimate');
   const note = $('#cmpNote');
   const warn = $('#cmpWarn');
+  let estimateToken = 0;
 
   const currentCodec = () => codecs.find((c) => c.id === codecSel.value) || codecs[0];
+  const currentLevel = () => levels.find((x) => x.id === levelSel.value) || levels[0];
 
-  function refreshTiers() {
-    const codec = currentCodec();
-    tierSel.innerHTML = (codec.tiers || []).map((x) => {
-      const selected = x.id === 'balanced' ? ' selected' : '';
-      return `<option value="${esc(x.id)}"${selected}>${esc(x.label)} — ${esc(x.note)}</option>`;
-    }).join('');
-    refreshNote();
+  // 体积预估是异步的，用 token 丢弃过期响应，避免快速切换时显示错的结果
+  async function refreshEstimate() {
+    const token = ++estimateToken;
+    estimateBox.textContent = t('estimating');
+    try {
+      const data = await api('/api/media/estimate', {
+        method: 'POST', body: { paths, level: levelSel.value },
+      });
+      if (token !== estimateToken) return;
+      if (data.total_source && data.total_estimated) {
+        const pct = Math.round((1 - data.total_estimated / data.total_source) * 100);
+        estimateBox.textContent = t('estimateLine', {
+          from: humanSize(data.total_source),
+          to: humanSize(data.total_estimated),
+          pct,
+        });
+      } else {
+        estimateBox.textContent = t('estimateFail');
+      }
+    } catch (err) {
+      if (token === estimateToken) estimateBox.textContent = err.message;
+    }
   }
 
   function refreshNote() {
     const codec = currentCodec();
-    const tier = (codec.tiers || []).find((x) => x.id === tierSel.value) || {};
-    const parts = [];
-    if (tier.note) parts.push(tier.note);
+    const level = currentLevel();
+    const parts = [level.note];
     if (codec.minutes_per_source_hour) {
       parts.push(t('compressPerHour', { time: humanDuration(codec.minutes_per_source_hour) }));
     }
-    note.textContent = parts.join(' · ');
+    note.textContent = parts.filter(Boolean).join(' · ');
     warn.classList.toggle('hidden', codec.id !== 'av1');
   }
 
-  codecSel.onchange = refreshTiers;
-  tierSel.onchange = refreshNote;
-  refreshTiers();
+  codecSel.onchange = refreshNote;
+  levelSel.onchange = () => { refreshNote(); refreshEstimate(); };
+  refreshNote();
+  refreshEstimate();
 
   $('#cmpCancel').onclick = closeModal;
   $('#cmpStart').onclick = async () => {
     const codec = codecSel.value;
-    const tier = tierSel.value;
+    const level = levelSel.value;
     const cropOn = $('#cmpCrop').checked;
     try {
       const result = await api('/api/media/compress', {
         method: 'POST',
-        body: { paths, codec, tier, crop_to_16x9: cropOn },
+        body: { paths, codec, level, crop_to_16x9: cropOn },
       });
       closeModal();
       S.jobsHidden = false;

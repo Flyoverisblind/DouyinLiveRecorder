@@ -211,23 +211,38 @@ def main():
                   (info['video']['width'], info['video']['height']) == (640, 360),
                   f"{info['video']['width']}x{info['video']['height']}")
 
-        # 压缩：档位元数据 + 参数校验 + 真实跑一次
+        # 压缩：编码器/强度元数据 + 体积预估 + 参数校验 + 真实跑一次
         r = get('/api/media/presets')
         presets = r.json()
         check('GET /api/media/presets', r.status_code == 200
               and [c['id'] for c in presets.get('codecs', [])] == ['h264', 'av1'])
+        check('  返回压缩强度三档',
+              [x['id'] for x in presets.get('levels', [])] == ['light', 'medium', 'strong'],
+              str([x['id'] for x in presets.get('levels', [])]))
         check('  返回耗时预估', all(c.get('minutes_per_source_hour')
                                 for c in presets.get('codecs', [])))
+
+        r = post('/api/media/estimate', {'paths': [clip], 'level': 'medium'})
+        est = r.json()
+        check('POST /api/media/estimate', r.status_code == 200 and est.get('items'))
+        estimated = (est.get('items') or [{}])[0]
+        check('  给出预计体积且小于源',
+              0 < (estimated.get('estimated_size') or 0) < (estimated.get('source_size') or 0),
+              f"{estimated.get('source_size')} -> {estimated.get('estimated_size')}")
+
+        r = post('/api/media/estimate', {'paths': [clip], 'level': 'ultra'})
+        check('estimate 非法强度被拒绝(400)', r.status_code == 400,
+              str(r.json().get('error'))[:50])
 
         r = post('/api/media/compress', {'paths': [clip], 'codec': 'vp9'})
         check('compress 非法编码器被拒绝(400)', r.status_code == 400,
               str(r.json().get('error'))[:50])
-        r = post('/api/media/compress', {'paths': [clip], 'codec': 'h264', 'tier': 'ultra'})
-        check('compress 非法档位被拒绝(400)', r.status_code == 400,
+        r = post('/api/media/compress', {'paths': [clip], 'codec': 'h264', 'level': 'ultra'})
+        check('compress 非法强度被拒绝(400)', r.status_code == 400,
               str(r.json().get('error'))[:50])
 
         r = post('/api/media/compress', {'paths': [clip], 'codec': 'h264',
-                                         'tier': 'small', 'crop_to_16x9': True})
+                                         'level': 'strong', 'crop_to_16x9': True})
         jobs = r.json().get('jobs') or [{}]
         cjob_id = jobs[0].get('id', '')
         check('compress 已入队', r.status_code == 200 and bool(cjob_id))

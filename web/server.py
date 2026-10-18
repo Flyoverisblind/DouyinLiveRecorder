@@ -831,17 +831,51 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 'av1_available': media_tools.is_av1_supported(app.project_root),
             })
 
+        if route == '/api/media/estimate' and method == 'POST':
+            payload = body()
+            targets = [p for p in (payload.get('paths') or []) if p]
+            if not targets:
+                raise ApiError('请先选择要压缩的文件')
+            level = (payload.get('level') or 'medium').lower()
+            if level not in media_tools.COMPRESS_LEVELS:
+                raise ApiError(f'不支持的压缩强度: {level}')
+            items = []
+            for target in targets:
+                try:
+                    info = media_tools.probe(target, app.project_root)
+                    estimate = media_tools.estimate_compress(info, level)
+                except media_tools.MediaError as exc:
+                    items.append({'path': target, 'name': os.path.basename(target),
+                                  'ok': False, 'error': str(exc)})
+                    continue
+                items.append({
+                    'path': target,
+                    'name': os.path.basename(target),
+                    'ok': estimate.get('ok', False),
+                    'error': estimate.get('reason', ''),
+                    'source_size': info['size'],
+                    'duration': info['duration'],
+                    **{k: v for k, v in estimate.items() if k != 'ok'},
+                })
+            total_source = sum(i.get('source_size') or 0 for i in items)
+            total_estimated = sum(i.get('estimated_size') or 0 for i in items)
+            return self._json({
+                'ok': True, 'items': items, 'level': level,
+                'total_source': total_source, 'total_estimated': total_estimated,
+                'total_ratio': round(total_estimated / total_source, 4) if total_source else None,
+            })
+
         if route == '/api/media/compress' and method == 'POST':
             payload = body()
             targets = [p for p in (payload.get('paths') or []) if p]
             if not targets:
                 raise ApiError('请先选择要压缩的文件')
             codec = (payload.get('codec') or 'h264').lower()
-            tier = (payload.get('tier') or 'balanced').lower()
-            if codec not in media_tools.QUALITY_TIERS:
+            level = (payload.get('level') or 'medium').lower()
+            if codec not in media_tools.CODEC_SETTINGS:
                 raise ApiError(f'不支持的编码器: {codec}')
-            if tier not in media_tools.QUALITY_TIERS[codec]:
-                raise ApiError(f'不支持的画质档位: {tier}')
+            if level not in media_tools.COMPRESS_LEVELS:
+                raise ApiError(f'不支持的压缩强度: {level}')
             if codec == 'av1' and not media_tools.is_av1_supported(app.project_root):
                 raise ApiError('当前 ffmpeg 不包含 AV1 编码器（libsvtav1），请升级 ffmpeg')
             crop_to_16x9 = payload.get('crop_to_16x9', True) is not False
@@ -861,11 +895,11 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             jobs = []
             for target in targets:
 
-                def _run_compress(job, target=target, codec=codec, tier=tier,
+                def _run_compress(job, target=target, codec=codec, level=level,
                                   crop_to_16x9=crop_to_16x9, allow=allow_content_loss):
                     return media_tools.compress(
                         target, app.project_root, out_dir=out_dir, job=job,
-                        codec=codec, tier=tier, crop_to_16x9=crop_to_16x9,
+                        codec=codec, level=level, crop_to_16x9=crop_to_16x9,
                         allow_content_loss=allow)
 
                 job = app.media_jobs.start(

@@ -897,76 +897,108 @@ def to_16x9(path: str, project_root: str = None, out_dir: str = None, job=None,
 
 # ---------------------------------------------------------------- 压缩转码
 
-# 画质档位 -> 编码参数。数值来自在本机（i5-12400F）对真实录制素材的实测：
-#   H.264 CRF16 8.71Mbps SSIM .9923 / CRF20 5.28Mbps .9876
-#   AV1  p6 CRF34 4.30Mbps .9891 / p4 CRF32 4.99Mbps .9910
-# 注意：SVT-AV1 官方警告 preset>=10 是给自动化工具用的、可能出现画质问题，
-# 所以这里统一用 preset 6，宁可慢也不踩那个坑。
-QUALITY_TIERS = {
-    'h264': {
-        'high': {'codec': 'libx264', 'preset': 'veryfast', 'crf': 18,
-                 'label': '高质量', 'note': '接近原片，速度快，任何设备都能播'},
-        'balanced': {'codec': 'libx264', 'preset': 'veryfast', 'crf': 21,
-                     'label': '均衡', 'note': '体积约减半，肉眼几乎看不出差别'},
-        'small': {'codec': 'libx264', 'preset': 'veryfast', 'crf': 24,
-                  'label': '小体积', 'note': '体积最小，快速运动的画面可能有细微损失'},
-    },
-    'av1': {
-        'high': {'codec': 'libsvtav1', 'preset': 6, 'crf': 28,
-                 'label': '高质量', 'note': '比同档 H.264 更小，但很慢'},
-        'balanced': {'codec': 'libsvtav1', 'preset': 6, 'crf': 32,
-                     'label': '均衡', 'note': '体积与 H.264 均衡档相近，画质略好'},
-        'small': {'codec': 'libsvtav1', 'preset': 6, 'crf': 36,
-                  'label': '小体积', 'note': '体积最小，老设备可能不支持 AV1'},
-    },
+# 压缩强度 -> 目标码率 = 源视频码率 × ratio
+#
+# 为什么用「目标码率」而不是 CRF：CRF 是「按画质」编码，它保证画质但不保证体积变小。
+# 实测：一个已经压到 5.1 Mbps 的录像，用 CRF21 重编码出来还是 5.10 Mbps（体积 100%），
+# 用户会以为功能坏了。改成按源码率打折，体积才变得可预期。
+# 实测（1080p60 真实素材，源 5.10 Mbps，SSIM 以原片为参考）：
+#   50% -> 2.44 Mbps, SSIM .9716 ; 35% -> 1.68 Mbps, .9589 ; 25% -> 1.18 Mbps, .9402
+COMPRESS_LEVELS = {
+    'light': {'ratio': 0.70, 'label': '轻度', 'note': '体积降到约 70%，肉眼很难看出差别'},
+    'medium': {'ratio': 0.50, 'label': '中等', 'note': '体积减半，日常观看够用'},
+    'strong': {'ratio': 0.30, 'label': '强力', 'note': '体积降到约三成，快速画面会开始糊'},
 }
 
-# 本机实测编码速度（1080p60，帧/秒），只用于界面上的耗时预估
-ENCODE_SPEED_HINT = {'h264': 150.0, 'av1': 41.0}
-
-CODEC_LABELS = {
-    'h264': 'H.264（快，兼容所有播放器）',
-    'av1': 'AV1（体积更小，很慢，老设备可能不支持）',
+# 编码器 -> 参数。AV1 统一 preset 6：SVT 官方警告 preset>=10 是给自动化工具用的、
+# 可能出现画质问题（实测同码率下 preset10 的 SSIM 反而低于 H.264）。
+CODEC_SETTINGS = {
+    'h264': {'codec': 'libx264', 'preset': 'veryfast', 'speed_fps': 150.0,
+             'label': 'H.264（快，兼容所有播放器）'},
+    'av1': {'codec': 'libsvtav1', 'preset': 6, 'speed_fps': 41.0,
+            'label': 'AV1（同码率画质更好，但很慢，老设备可能不支持）'},
 }
 
 
 def presets_info() -> dict:
-    """给前端用的档位与耗时预估。速度按 1080p60 实测折算。"""
+    """给前端用的编码器 / 压缩强度与耗时预估。速度按 1080p60 实测折算。"""
     frames_per_source_hour = 3600 * 60
     codecs = []
-    for codec, tiers in QUALITY_TIERS.items():
-        speed = ENCODE_SPEED_HINT.get(codec) or 0
+    for codec, meta in CODEC_SETTINGS.items():
+        speed = meta.get('speed_fps') or 0
         codecs.append({
             'id': codec,
-            'label': CODEC_LABELS.get(codec, codec),
+            'label': meta['label'],
             'speed_fps': speed,
             'minutes_per_source_hour': round(frames_per_source_hour / speed / 60, 1) if speed else None,
-            'tiers': [dict(id=tier_id, **meta) for tier_id, meta in tiers.items()],
         })
-    return {'codecs': codecs}
+    levels = [dict(id=level_id, **meta) for level_id, meta in COMPRESS_LEVELS.items()]
+    return {'codecs': codecs, 'levels': levels}
+
+
+def _video_bitrate(info: dict) -> int:
+    """源视频码率（bps）；容器没给就按总大小减去音频估算。"""
+    bitrate = int((info['video'] or {}).get('bit_rate') or 0)
+    if bitrate > 0:
+        return bitrate
+    audio_bitrate = int((info.get('audio') or {}).get('bit_rate') or 0)
+    duration = info.get('duration') or 0
+    if duration > 0:
+        return max(1, int(info['size'] * 8 / duration - audio_bitrate))
+    return 0
+
+
+def estimate_compress(info: dict, level: str = 'medium') -> dict:
+    """估算按某个强度压缩后的体积，让用户点「开始」之前就知道会变成多大。"""
+    if level not in COMPRESS_LEVELS:
+        raise MediaError(f'不支持的压缩强度: {level}')
+    ratio = COMPRESS_LEVELS[level]['ratio']
+    video_bitrate = _video_bitrate(info)
+    if video_bitrate <= 0:
+        return {'ok': False, 'reason': '无法获取源视频码率，无法估算体积'}
+    audio_bitrate = int((info.get('audio') or {}).get('bit_rate') or 0)
+    target_video = max(1, int(video_bitrate * ratio))
+    target_total = target_video + audio_bitrate
+    duration = info.get('duration') or 0
+    estimated_size = int(target_total * duration / 8) if duration else 0
+    return {
+        'ok': True,
+        'level': level,
+        'ratio': ratio,
+        'source_video_bitrate': video_bitrate,
+        'target_video_bitrate': target_video,
+        'audio_bitrate': audio_bitrate,
+        'estimated_size': estimated_size,
+        'source_size': info['size'],
+        'estimated_ratio': round(estimated_size / info['size'], 4) if info['size'] else None,
+    }
 
 
 def compress(path: str, project_root: str = None, out_dir: str = None, job=None,
-             codec: str = 'h264', tier: str = 'balanced', crop_to_16x9: bool = True,
+             codec: str = 'h264', level: str = 'medium', crop_to_16x9: bool = True,
              drop_source: bool = False, output: str = None,
              allow_content_loss: bool = False) -> dict:
     """把视频重编码成更小的 MP4，可选在同一趟里裁掉黑边转 16:9。
 
-    与「转为16:9」不同，这个是真重编码，所以体积会明显下降，但画面会经过一次
-    有损压缩；H.264 很快，AV1 很慢（一个 4 小时录像可能要 6 小时以上）。
+    压缩强度按「源码率 × ratio」决定目标码率，因此体积是可预期的；
+    代价是画面会再经历一次有损压缩。H.264 很快，AV1 很慢。
     """
     codec = (codec or 'h264').lower()
-    tier = (tier or 'balanced').lower()
-    if codec not in QUALITY_TIERS:
+    level = (level or 'medium').lower()
+    if codec not in CODEC_SETTINGS:
         raise MediaError(f'不支持的编码器: {codec}')
-    if tier not in QUALITY_TIERS[codec]:
-        raise MediaError(f'不支持的画质档位: {tier}')
+    if level not in COMPRESS_LEVELS:
+        raise MediaError(f'不支持的压缩强度: {level}')
 
     path = os.path.abspath(path)
     if not os.path.isfile(path):
         raise MediaError(f'文件不存在: {path}')
     info = probe(path, project_root)
-    settings = QUALITY_TIERS[codec][tier]
+    settings = CODEC_SETTINGS[codec]
+    estimate = estimate_compress(info, level)
+    if not estimate.get('ok'):
+        raise MediaError(estimate.get('reason') or '无法估算目标码率')
+    target_video = estimate['target_video_bitrate']
 
     # 顺便处理黑边：既然要重编码，裁掉黑边是免费的
     crop = None
@@ -1008,13 +1040,21 @@ def compress(path: str, project_root: str = None, out_dir: str = None, job=None,
         audio_args = ['-an']
 
     ffmpeg = find_ffmpeg(project_root)
+    video_args = [
+        '-c:v', settings['codec'],
+        '-preset', str(settings['preset']),
+        '-b:v', str(target_video),
+    ]
+    if codec == 'h264':
+        # 限制峰值码率，避免复杂画面把平均码率顶上去导致体积超出预期
+        video_args += ['-maxrate', str(int(target_video * 1.5)),
+                       '-bufsize', str(int(target_video * 2))]
+
     cmd = [
         ffmpeg, '-hide_banner', '-y', '-nostdin', '-i', path,
         '-map', '0:v:0', '-map', '0:a:0?',
         '-vf', ','.join(filters),
-        '-c:v', settings['codec'],
-        '-preset', str(settings['preset']),
-        '-crf', str(settings['crf']),
+    ] + video_args + [
         '-pix_fmt', 'yuv420p',
         '-fps_mode', 'passthrough',
     ] + audio_args + [
@@ -1025,7 +1065,9 @@ def compress(path: str, project_root: str = None, out_dir: str = None, job=None,
     ]
 
     label = 'AV1' if codec == 'av1' else 'H.264'
-    _job_update(job, 2.0, f'开始用 {label} 重编码（{settings["label"]}）')
+    _job_update(job, 2.0,
+                f'开始用 {label} 重编码（目标 {target_video / 1e6:.2f} Mbps，'
+                f'{COMPRESS_LEVELS[level]["label"]}）')
     _run_with_progress(cmd, info['duration'], job)
 
     if not os.path.exists(output):
@@ -1033,6 +1075,10 @@ def compress(path: str, project_root: str = None, out_dir: str = None, job=None,
 
     size = os.path.getsize(output)
     source_size = info['size']
+    saved_ratio = round(1 - size / source_size, 4) if source_size else 0
+    if saved_ratio < 0.05:
+        warnings.append('压缩后体积几乎没变：这个文件的码率本来就很低，'
+                        '换更强的压缩强度或改用 AV1 才有明显效果')
     return {
         'output': output,
         'name': os.path.basename(output),
@@ -1041,13 +1087,13 @@ def compress(path: str, project_root: str = None, out_dir: str = None, job=None,
         'source_size': source_size,
         'codec': codec,
         'codec_label': label,
-        'tier': tier,
-        'tier_label': settings['label'],
-        'crf': settings['crf'],
-        'preset': settings['preset'],
+        'level': level,
+        'level_label': COMPRESS_LEVELS[level]['label'],
+        'target_video_bitrate': target_video,
+        'estimated_size': estimate.get('estimated_size'),
         'lossless': False,
         'saved_bytes': source_size - size,
-        'saved_ratio': round(1 - size / source_size, 4) if source_size else 0,
+        'saved_ratio': saved_ratio,
         'crop': crop,
         'duration': info['duration'],
         'warnings': warnings,

@@ -66,20 +66,40 @@ def test_pure():
     # 压缩档位元数据
     presets = mt.presets_info()
     codec_ids = [c['id'] for c in presets['codecs']]
-    check('压缩档位含 h264 / av1', codec_ids == ['h264', 'av1'], str(codec_ids))
-    h264_tiers = next(c for c in presets['codecs'] if c['id'] == 'h264')['tiers']
-    check('每档都有 crf/preset/说明',
-          all(t.get('crf') is not None and t.get('preset') not in (None, '') and t.get('note')
-              for t in h264_tiers), str([t['id'] for t in h264_tiers]))
-    av1_tiers = next(c for c in presets['codecs'] if c['id'] == 'av1')['tiers']
-    check('AV1 不使用 preset>=10（SVT 官方警告该档位不保证画质）',
-          all(int(t['preset']) < 10 for t in av1_tiers), str([t['preset'] for t in av1_tiers]))
+    check('压缩编码器含 h264 / av1', codec_ids == ['h264', 'av1'], str(codec_ids))
+    level_ids = [l['id'] for l in presets['levels']]
+    check('压缩强度三档', level_ids == ['light', 'medium', 'strong'], str(level_ids))
+    ratios = [l['ratio'] for l in presets['levels']]
+    check('强度依次减弱（ratio 递减）', ratios == sorted(ratios, reverse=True), str(ratios))
+    check('每档都有说明', all(l.get('note') for l in presets['levels']))
+    check('AV1 使用 preset<10（SVT 官方警告该档位不保证画质）',
+          int(mt.CODEC_SETTINGS['av1']['preset']) < 10, str(mt.CODEC_SETTINGS['av1']['preset']))
     check('耗时预估都是正数',
           all(c['minutes_per_source_hour'] and c['minutes_per_source_hour'] > 0
               for c in presets['codecs']))
     check('AV1 预估耗时比 H.264 长',
           next(c for c in presets['codecs'] if c['id'] == 'av1')['minutes_per_source_hour']
           > next(c for c in presets['codecs'] if c['id'] == 'h264')['minutes_per_source_hour'])
+
+    # 体积估算：按源码率打折（CRF 是按画质、不保证变小，所以不能用 CRF 承诺体积）
+    # 构造一份自洽的数据：5 Mbps 视频 + 128 kbps 音频，100 秒 -> 64.1 MB
+    src_total_bitrate = 5_000_000 + 128_000
+    est_info = {'size': int(src_total_bitrate * 100 / 8), 'duration': 100.0,
+                'audio': {'bit_rate': 128000}, 'video': {'bit_rate': 5_000_000}}
+    est = mt.estimate_compress(est_info, 'medium')
+    check('估算目标码率 = 源码率 × 0.5', est['target_video_bitrate'] == 2_500_000,
+          str(est['target_video_bitrate']))
+    check('估算体积含音频', est['estimated_size'] == int((2_500_000 + 128_000) * 100 / 8),
+          str(est['estimated_size']))
+    expected_ratio = (2_500_000 + 128_000) / src_total_bitrate
+    check('估算比例 ≈ 目标码率占比', abs(est['estimated_ratio'] - expected_ratio) < 0.005,
+          f"{est['estimated_ratio']} vs {expected_ratio:.4f}")
+    fallback = mt.estimate_compress(
+        {'size': 100_000_000, 'duration': 100.0, 'audio': {'bit_rate': 128000},
+         'video': {'bit_rate': 0}}, 'medium')
+    check('缺少 video.bit_rate 时按总大小推算',
+          fallback['ok'] and fallback['source_video_bitrate'] > 0,
+          str(fallback.get('source_video_bitrate')))
 
     # 1920x1810、内容占顶部 1078 行 —— 与真实案例一致的场景
     info = {'path': 'x', 'name': 'x.mp4', 'size': 1, 'mtime': 0, 'duration': 10,
@@ -251,31 +271,42 @@ def test_integration():
             check('单文件被拒绝合并', '2' in str(exc), str(exc)[:50])
 
         # --- 压缩转码（H.264 / AV1）
-        for codec, tier in (('h264', 'balanced'), ('av1', 'small')):
+        for codec, level in (('h264', 'medium'), ('av1', 'strong')):
             if codec == 'av1' and not mt.is_av1_supported():
                 print('    [跳过] 当前 ffmpeg 不支持 AV1')
                 continue
             small = os.path.join(tmp, f'cmp_{codec}.mp4')
-            made = _make_clip(ffmpeg, small, 320, 180, 180, seconds=2)
+            # 用稍大/稍长的素材：2 秒的极小片段码率控制来不及收敛，预估会偏得离谱
+            made = _make_clip(ffmpeg, small, 640, 360, 360, seconds=4)
             if made.returncode != 0:
                 check(f'压缩({codec}) 生成素材', False, (made.stderr or '')[-150:])
                 continue
-            result = mt.compress(small, codec=codec, tier=tier, crop_to_16x9=True)
+            src_info = mt.probe(small)
+            est = mt.estimate_compress(src_info, level)
+            result = mt.compress(small, codec=codec, level=level, crop_to_16x9=True)
             out_info = mt.probe(result['output'])
             expect = 'av1' if codec == 'av1' else 'h264'
             check(f'压缩({codec}) 输出编码正确', out_info['video']['codec'] == expect,
                   out_info['video']['codec'])
             check(f'压缩({codec}) 分辨率不变（无黑边时不裁）',
-                  (out_info['video']['width'], out_info['video']['height']) == (320, 180),
+                  (out_info['video']['width'], out_info['video']['height']) == (640, 360),
                   f"{out_info['video']['width']}x{out_info['video']['height']}")
             check(f'压缩({codec}) 音轨保留', out_info.get('audio') is not None,
                   str(out_info.get('audio')))
-            check(f'压缩({codec}) 有体积对比数据',
-                  isinstance(result.get('saved_ratio'), float),
+            check(f'压缩({codec}) 体积确实变小', result['saved_ratio'] > 0,
                   f"src={result['source_size']} out={result['size']}")
+            check(f'压缩({codec}) 结果含目标码率与强度',
+                  result.get('target_video_bitrate') and result.get('level') == level,
+                  str(result.get('target_video_bitrate')))
+            # 预估精度：H.264 的 ABR 收敛快；AV1 在短片段上容易超出目标，放宽到 1 倍
+            if est.get('ok') and est.get('estimated_size'):
+                delta = abs(result['size'] - est['estimated_size']) / est['estimated_size']
+                limit = 0.35 if codec == 'h264' else 1.0
+                check(f'压缩({codec}) 预估体积与实际接近', delta < limit,
+                      f'偏差 {delta*100:.0f}%（上限 {limit*100:.0f}%）')
 
-        # --- 非法编码器 / 档位必须拒绝
-        for bad in ({'codec': 'vp9'}, {'codec': 'h264', 'tier': 'ultra'}):
+        # --- 非法编码器 / 强度必须拒绝
+        for bad in ({'codec': 'vp9'}, {'codec': 'h264', 'level': 'ultra'}):
             try:
                 mt.compress(clips[0], **bad)
                 check(f'非法参数 {bad} 被拒绝', False, '没有抛错')
