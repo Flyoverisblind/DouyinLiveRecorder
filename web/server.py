@@ -123,26 +123,25 @@ class WebConsole:
 
         上游 main.py 遇到缺失的键会用 configparser 重写整个文件（注释就没了），
         控制台先按 schema 补齐，既保住注释，也能让新功能立刻出现在配置页上。
+
+        两个坑必须处理：
+        1. configparser 的键名**大小写不敏感**，而 schema 里可能写 `SMTP邮件服务器`、
+           文件里却是 `smtp邮件服务器`（main.py 用 configparser 写入时会小写）。
+           所以比较必须 casefold，否则会加出重复键，让 main.py 抛
+           DuplicateOptionError 直接起不来。
+        2. 历史遗留的重复键会直接把 main.py 打死，启动时顺手清一次。
         """
         if not os.path.isfile(self.config_file):
             return
         try:
+            config_store.dedupe_keys(self.config_file)
+        except Exception:
+            pass
+        try:
             existing = config_store.read_config_values(self.config_file)
         except Exception:
             return
-        updates = {}
-        for section_name, fields in schema_mod.FIELDS.items():
-            current = existing.get(section_name) or {}
-            missing = {}
-            for key, meta in fields.items():
-                if key in current:
-                    continue
-                value = meta.get('default', '')
-                if isinstance(value, bool):
-                    value = '是' if value else '否'
-                missing[key] = value
-            if missing:
-                updates[section_name] = missing
+        updates = schema_mod.missing_keys(existing)
         if not updates:
             return
         try:

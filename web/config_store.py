@@ -225,6 +225,47 @@ def update_config_file(path: str, updates: dict, encoding: str = ENCODING) -> di
         return {'ok': True, 'changed': changed, 'backup': backup}
 
 
+def dedupe_keys(path: str, encoding: str = ENCODING) -> dict:
+    """删除同一段里「大小写不敏感」重复的配置键，保留第一次出现。
+
+    configparser 的键名是大小写不敏感的：同一个段里同时出现 `SMTP邮件服务器` 和
+    `smtp邮件服务器`，会让 main.py 直接抛 DuplicateOptionError 起不来。
+    这里只删掉重复的那一行，注释、空行、顺序都不动。
+
+    返回 {'removed': 删除行数, 'backup': 备份路径}。
+    """
+    if not os.path.isfile(path):
+        return {'removed': 0, 'backup': None}
+    with _write_lock:
+        with open(path, 'r', encoding=encoding, newline='') as fp:
+            lines = fp.read().splitlines(keepends=True)
+
+        seen = {}
+        section = ''
+        kept = []
+        removed = 0
+        for line in lines:
+            stripped = line.rstrip('\r\n').strip()
+            if stripped.startswith('[') and stripped.endswith(']'):
+                section = stripped[1:-1]
+                seen.setdefault(section, set())
+            elif stripped and not stripped.startswith(('#', ';')) and '=' in stripped:
+                key = stripped.split('=', 1)[0].strip().casefold()
+                bucket = seen.setdefault(section, set())
+                if key in bucket:
+                    removed += 1
+                    continue
+                bucket.add(key)
+            kept.append(line)
+
+        if not removed:
+            return {'removed': 0, 'backup': None}
+        backup = backup_file(path)
+        with open(path, 'w', encoding=encoding, newline='') as fp:
+            fp.write(''.join(kept))
+        return {'removed': removed, 'backup': backup}
+
+
 def backup_file(path: str, keep: int = 20) -> str:
     """写入前备份，最多保留 keep 份。"""
     if not os.path.isfile(path):

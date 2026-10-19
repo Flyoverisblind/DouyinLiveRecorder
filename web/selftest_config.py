@@ -103,5 +103,35 @@ print('    解析:', [(i['enabled'], i['quality'], i['url'], i['name'])
 print('[8] save_path:', paths.resolve_save_path(PROJECT_ROOT))
 print('    python:', paths.pick_python(PROJECT_ROOT))
 
+# 9. 重复键与大小写
+#    configparser 的键名大小写不敏感：同段里同时出现 SMTP邮件服务器 和 smtp邮件服务器
+#    会让 main.py 抛 DuplicateOptionError 直接起不来。这里锁死相关行为。
+print('[9] 重复键与大小写:')
+dup_file = os.path.join(tmpdir, 'dup.ini')
+with open(dup_file, 'w', encoding='utf-8-sig', newline='') as fp:
+    fp.write('[推送配置]\n# 注释要保留\nsmtp邮件服务器 =\nSMTP邮件服务器 = \n其它键 = 1\n')
+
+removed = config_store.dedupe_keys(dup_file)
+dup_text = open(dup_file, encoding='utf-8-sig').read()
+ok_dedupe = (removed['removed'] == 1
+             and 'SMTP邮件服务器' not in dup_text
+             and '# 注释要保留' in dup_text
+             and '其它键 = 1' in dup_text)
+print('    大小写重复键被清理:', '通过' if ok_dedupe else '失败', removed)
+
+again = config_store.dedupe_keys(dup_file)
+ok_noop = again['removed'] == 0
+print('    已无重复时不再改动:', '通过' if ok_noop else '失败', again)
+
+miss = schema_mod.missing_keys({'推送配置': {'smtp邮件服务器': '', 'SMTP邮件服务器端口': '465'}})
+push_missing = miss.get('推送配置', {})
+ok_case = 'SMTP邮件服务器' not in push_missing and 'SMTP邮件服务器端口' not in push_missing
+print('    大小写不同不判为缺失:', '通过' if ok_case else '失败',
+      f'（仍判缺失 {len(push_missing)} 个真正缺失的键）')
+
+if not (ok_dedupe and ok_noop and ok_case):
+    shutil.rmtree(tmpdir, ignore_errors=True)
+    raise SystemExit('配置层自检失败：重复键 / 大小写处理有误')
+
 shutil.rmtree(tmpdir, ignore_errors=True)
 print('\n配置层自检通过')

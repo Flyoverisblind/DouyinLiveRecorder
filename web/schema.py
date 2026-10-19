@@ -58,6 +58,31 @@ QUALITY_OPTIONS = ['原画', '蓝光', '超清', '高清', '标清', '流畅']
 FORMAT_OPTIONS = ['ts', 'mkv', 'flv', 'mp4', 'mp3音频', 'm4a音频']
 PUSH_CHANNELS = ['微信', '钉钉', 'TG', '邮箱', 'BARK', 'NTFY', 'PUSHPLUS']
 
+
+def missing_keys(existing: dict) -> dict:
+    """返回 {段: {键: 默认值}}：schema 里登记、但 existing 里还没有的键。
+
+    比较必须**大小写不敏感**：configparser 的键名不区分大小写，而 main.py 用
+    configparser 写入缺省项时会把键名小写（`smtp邮件服务器`），schema 里写的却是
+    `SMTP邮件服务器`。按大小写敏感比较会误判成「缺键」再加一条，
+    导致同一个段里出现两个等价键 —— main.py 会直接抛 DuplicateOptionError 起不来。
+    """
+    missing = {}
+    for section_name, fields in FIELDS.items():
+        current = existing.get(section_name) or {}
+        known = {str(key).casefold() for key in current}
+        todo = {}
+        for key, meta in fields.items():
+            if str(key).casefold() in known:
+                continue
+            value = meta.get('default', '')
+            if isinstance(value, bool):
+                value = '是' if value else '否'
+            todo[key] = value
+        if todo:
+            missing[section_name] = todo
+    return missing
+
 PROXY_PLATFORM_SUGGESTIONS = [
     'tiktok', 'soop', 'pandalive', 'winktv', 'flextv', 'popkontv', 'twitch', 'liveme',
     'showroom', 'chzzk', 'shopee', 'shp', 'youtu', 'faceit', 'picarto', 'migu',
