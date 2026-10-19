@@ -29,6 +29,7 @@ import configparser
 import httpx
 from src import spider, stream
 from src.proxy import ProxyDetector
+from src.post_process import PostProcessQueue, parse_config as parse_post_process_config
 from src.utils import logger
 from src import utils
 from msg_push import (
@@ -62,6 +63,7 @@ exit_recording = False
 need_update_line_list = []
 first_run = True
 not_record_list = []
+post_process_queue = None
 start_display_time = datetime.datetime.now()
 global_proxy = False
 recording_time_list = {}
@@ -486,6 +488,19 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
             script_command = script_command.strip() + ' ' + ' '.join(params)
             run_script(script_command)
             logger.debug("脚本命令执行结束!")
+
+        # 录制结束后的自动后处理（裁黑边 / 压缩）。
+        # 这里只做「入队」，真正的结束确认（等待、断流重连判断、文件稳定性）都在
+        # 后台线程里做，避免拖慢录制主循环。
+        if post_process_queue is not None and '音频' not in save_type:
+            if split_video_by_time:
+                logger.info(f"[自动处理] {record_name} 开启了分段录制，"
+                            f"分段文件暂不支持自动后处理，已跳过")
+            else:
+                try:
+                    post_process_queue.enqueue(record_name, save_file_path)
+                except Exception as exc:  # noqa: BLE001 - 不能因为后处理影响录制
+                    logger.error(f"[自动处理] 加入队列失败: {type(exc).__name__}: {exc}")
 
     else:
         color_obj.print_colored(f"\n{record_name} {stop_time} 直播录制出错,返回码: {return_code}\n", color_obj.RED)
@@ -1836,6 +1851,30 @@ while True:
     create_time_file = options.get(read_config_value(config, '录制设置', '生成时间字幕文件', "否"), False)
     is_run_script = options.get(read_config_value(config, '录制设置', '是否录制完成后执行自定义脚本', "否"), False)
     custom_script = read_config_value(config, '录制设置', '自定义脚本执行命令', "") if is_run_script else None
+    auto_post_process = options.get(read_config_value(config, '录制设置', '录制完成后自动处理', "否"), False)
+    auto_post_config = parse_post_process_config(
+        auto_post_process,
+        read_config_value(config, '录制设置', '自动处理方式', "压缩(含裁边)"),
+        read_config_value(config, '录制设置', '自动压缩编码器', "H.264"),
+        read_config_value(config, '录制设置', '自动压缩强度', "中等(50%)"),
+        read_config_value(config, '录制设置', '结束确认等待(秒)', 120),
+        read_config_value(config, '录制设置', '自动处理最小文件(MB)', 50),
+    )
+    # 配置是每轮重新读取的，所以队列只建一次，之后只热更新配置，
+    # 否则每轮循环都会多出一个后台线程。
+    if post_process_queue is None and auto_post_config['enabled']:
+        post_process_queue = PostProcessQueue(
+            auto_post_config,
+            recording_snapshot=lambda: set(recording),
+            project_root=script_path,
+        )
+        post_process_queue.start()
+        logger.info(f"[自动处理] 已启用：方式={auto_post_config['mode']} "
+                    f"编码器={auto_post_config['codec']} 强度={auto_post_config['level']} "
+                    f"结束确认等待={auto_post_config['delay_seconds']}秒 "
+                    f"最小文件={auto_post_config['min_size_mb']}MB")
+    elif post_process_queue is not None:
+        post_process_queue.config = auto_post_config
     enable_proxy_platform = read_config_value(
         config, '录制设置', '使用代理录制的平台(逗号分隔)',
         'tiktok, soop, pandalive, winktv, flextv, popkontv, twitch, liveme, showroom, chzzk, shopee, shp, youtu, faceit'

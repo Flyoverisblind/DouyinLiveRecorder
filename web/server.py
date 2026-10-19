@@ -118,6 +118,38 @@ class WebConsole:
             os.makedirs(os.path.dirname(self.url_file), exist_ok=True)
             config_store.write_url_lines(self.url_file, [])
 
+    def ensure_schema_keys(self) -> None:
+        """把 schema 里登记、但 config.ini 里还不存在的键补上默认值。
+
+        上游 main.py 遇到缺失的键会用 configparser 重写整个文件（注释就没了），
+        控制台先按 schema 补齐，既保住注释，也能让新功能立刻出现在配置页上。
+        """
+        if not os.path.isfile(self.config_file):
+            return
+        try:
+            existing = config_store.read_config_values(self.config_file)
+        except Exception:
+            return
+        updates = {}
+        for section_name, fields in schema_mod.FIELDS.items():
+            current = existing.get(section_name) or {}
+            missing = {}
+            for key, meta in fields.items():
+                if key in current:
+                    continue
+                value = meta.get('default', '')
+                if isinstance(value, bool):
+                    value = '是' if value else '否'
+                missing[key] = value
+            if missing:
+                updates[section_name] = missing
+        if not updates:
+            return
+        try:
+            config_store.update_config_file(self.config_file, updates)
+        except Exception:
+            pass
+
     def ensure_dirs(self) -> None:
         """与 main.py 行为一致：提前建好保存目录与日志目录，保证文件页可用。"""
         for target in (paths.default_save_path(self.project_root),
@@ -1149,6 +1181,7 @@ def main():
     app = WebConsole(project_root, python_exe, host=args.host, port=port)
     app.ensure_config()
     app.ensure_url_file()
+    app.ensure_schema_keys()
     app.ensure_dirs()
 
     server = ConsoleServer((args.host, port), ConsoleHandler, app, token=args.token)

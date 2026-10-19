@@ -564,13 +564,30 @@ def _job_output(job, path: str):
         setter(path)
 
 
-def _run_with_progress(cmd: list, total_duration: float, job=None, timeout: int = 86400) -> str:
+def _low_priority_kwargs() -> dict:
+    """让重编码进程以低优先级运行。
+
+    录制结束后的自动处理会和下一次开播抢 CPU，把编码器降级能明显减少对录制的干扰
+    （录制时丢帧是不可逆的损失，编码慢一点无所谓）。
+    """
+    if os.name == 'nt':
+        flags = getattr(subprocess, 'BELOW_NORMAL_PRIORITY_CLASS', 0x00004000)
+        return {'creationflags': flags}
+    try:
+        return {'preexec_fn': lambda: os.nice(19)}
+    except (AttributeError, OSError):
+        return {}
+
+
+def _run_with_progress(cmd: list, total_duration: float, job=None, timeout: int = 86400,
+                       low_priority: bool = False) -> str:
     """执行 ffmpeg 并解析 `-progress pipe:1` 输出，返回 stderr/stdout 尾部文本。"""
     _job_check(job)
+    extra = _low_priority_kwargs() if low_priority else {}
     process = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, encoding='utf-8', errors='replace',
-        bufsize=1, startupinfo=_startupinfo(),
+        bufsize=1, startupinfo=_startupinfo(), **extra,
     )
     if job is not None:
         job.attach_process(process)
@@ -783,7 +800,7 @@ def _calibrate_sps(path: str, target_h: int, frame_h: int, crop_y: int,
 
 def _reencode_aspect(path: str, output: str, crop: dict, info: dict, job=None,
                      crf: int = DEFAULT_CRF, preset: str = DEFAULT_PRESET,
-                     project_root: str = None) -> dict:
+                     project_root: str = None, low_priority: bool = False) -> dict:
     """重编码裁切（兼容非 H.264 / 需要裁左右的情况）。音轨尽量原样复制。"""
     ffmpeg = find_ffmpeg(project_root)
     audio = info.get('audio')
@@ -805,14 +822,15 @@ def _reencode_aspect(path: str, output: str, crop: dict, info: dict, job=None,
         '-progress', 'pipe:1', '-nostats', output,
     ]
     _job_update(job, 1.0, f'正在重编码裁切（{preset} / CRF {crf}）')
-    _run_with_progress(cmd, info['duration'], job)
+    _run_with_progress(cmd, info['duration'], job, low_priority=low_priority)
     return {'mode': 'reencode', 'lossless': False}
 
 
 def to_16x9(path: str, project_root: str = None, out_dir: str = None, job=None,
             prefer_lossless: bool = True, crf: int = DEFAULT_CRF,
             preset: str = DEFAULT_PRESET, drop_source: bool = False,
-            allow_content_loss: bool = False, output: str = None) -> dict:
+            allow_content_loss: bool = False, output: str = None,
+            low_priority: bool = False) -> dict:
     """把单个视频裁成 16:9：优先走 SPS 元数据（无损），否则重编码。"""
     path = os.path.abspath(path)
     if not os.path.isfile(path):
@@ -857,7 +875,7 @@ def to_16x9(path: str, project_root: str = None, out_dir: str = None, job=None,
                 '-progress', 'pipe:1', '-nostats', output,
             ]
             _job_update(job, 8.0, '正在改写裁剪元数据（不重新编码）')
-            _run_with_progress(cmd, info['duration'], job)
+            _run_with_progress(cmd, info['duration'], job, low_priority=low_priority)
             lossless = True
             detail = f"crop_bottom={calibration['crop_bottom']}"
         else:
@@ -865,7 +883,8 @@ def to_16x9(path: str, project_root: str = None, out_dir: str = None, job=None,
             mode = 'reencode'
 
     if mode != 'sps' or not lossless:
-        _reencode_aspect(path, output, crop, info, job, crf, preset, project_root)
+        _reencode_aspect(path, output, crop, info, job, crf, preset, project_root,
+                         low_priority=low_priority)
         lossless = False
 
     if not os.path.exists(output):
@@ -977,7 +996,7 @@ def estimate_compress(info: dict, level: str = 'medium') -> dict:
 def compress(path: str, project_root: str = None, out_dir: str = None, job=None,
              codec: str = 'h264', level: str = 'medium', crop_to_16x9: bool = True,
              drop_source: bool = False, output: str = None,
-             allow_content_loss: bool = False) -> dict:
+             allow_content_loss: bool = False, low_priority: bool = False) -> dict:
     """把视频重编码成更小的 MP4，可选在同一趟里裁掉黑边转 16:9。
 
     压缩强度按「源码率 × ratio」决定目标码率，因此体积是可预期的；
@@ -1068,7 +1087,7 @@ def compress(path: str, project_root: str = None, out_dir: str = None, job=None,
     _job_update(job, 2.0,
                 f'开始用 {label} 重编码（目标 {target_video / 1e6:.2f} Mbps，'
                 f'{COMPRESS_LEVELS[level]["label"]}）')
-    _run_with_progress(cmd, info['duration'], job)
+    _run_with_progress(cmd, info['duration'], job, low_priority=low_priority)
 
     if not os.path.exists(output):
         raise MediaError('压缩失败：未生成输出文件')

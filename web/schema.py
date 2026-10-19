@@ -140,6 +140,66 @@ FIELDS = {
         ),
         '追加格式后删除原文件': dict(type='bool', default='是', label={'zh': '转码后删除原文件', 'en': 'Delete source after convert'}),
         '生成时间字幕文件': dict(type='bool', default='否', label={'zh': '生成时间字幕文件', 'en': 'Generate subtitle file'}),
+        '录制完成后自动处理': dict(
+            type='bool', default='否',
+            label={'zh': '录完自动裁边/压缩', 'en': 'Auto crop / compress after recording'},
+            help={
+                'zh': '录制结束后自动把黑边裁成 16:9、或重编码压缩。会先等一段时间确认录制'
+                      '真的结束（断流重连不会误处理），再以低优先级在后台跑。',
+                'en': 'After a recording ends, crop black bars to 16:9 and/or re-encode to a '
+                      'smaller file. Waits to confirm the recording really ended, then runs in '
+                      'the background at low priority.',
+            },
+        ),
+        '自动处理方式': dict(
+            type='select', options=['仅无损裁边转16:9', '压缩(含裁边)', '先无损裁边再压缩'],
+            default='压缩(含裁边)', depends_on='录制完成后自动处理',
+            label={'zh': '自动处理方式', 'en': 'What to do'},
+            help={
+                'zh': '仅无损裁边：零画质损失但体积不变；压缩(含裁边)：体积变小、一步到位，推荐；'
+                      '先裁边再压缩：多留一份无损 16:9 存档，但多一次生成损失。',
+                'en': 'Lossless crop: no quality loss, same size; Compress: smaller in one pass '
+                      '(recommended); Crop then compress: keeps a lossless 16:9 copy as well.',
+            },
+        ),
+        '自动压缩编码器': dict(
+            type='select', options=['H.264', 'AV1'], default='H.264',
+            depends_on='录制完成后自动处理',
+            label={'zh': '自动压缩编码器', 'en': 'Auto compress codec'},
+            help={
+                'zh': 'H.264 快且处处可播；AV1 同码率画质略好但慢约 3.5 倍，旧设备可能不支持。',
+                'en': 'H.264 is fast and universally playable; AV1 is ~3.5x slower.',
+            },
+        ),
+        '自动压缩强度': dict(
+            type='select', options=['轻度(70%)', '中等(50%)', '强力(30%)'],
+            default='中等(50%)', depends_on='录制完成后自动处理',
+            label={'zh': '自动压缩强度', 'en': 'Auto compress strength'},
+            help={
+                'zh': '按源码率打折：轻度 70% / 中等 50% / 强力 30%。',
+                'en': 'Targets a percentage of the source bitrate: 70% / 50% / 30%.',
+            },
+        ),
+        '结束确认等待(秒)': dict(
+            type='int', default=120, min=0, max=3600,
+            depends_on='录制完成后自动处理',
+            label={'zh': '结束确认等待(秒)', 'en': 'End-confirm delay (s)'},
+            help={
+                'zh': '录完先等这么久再处理。断流重连通常发生在这个窗口内——如果同一主播又'
+                      '开始录制，就判定为重连并跳过，避免把切碎的片段当完整录像处理。',
+                'en': 'Wait this long before processing. Reconnects usually happen within this '
+                      'window; if the same room resumes, the fragment is skipped.',
+            },
+        ),
+        '自动处理最小文件(MB)': dict(
+            type='int', default=50, min=0, max=100000,
+            depends_on='录制完成后自动处理',
+            label={'zh': '自动处理最小文件(MB)', 'en': 'Min file size (MB)'},
+            help={
+                'zh': '小于这个体积的录像视为碎片，不做处理，免得白跑几个小时。',
+                'en': 'Recordings smaller than this are treated as fragments and skipped.',
+            },
+        ),
         '是否录制完成后执行自定义脚本': dict(type='bool', default='否', label={'zh': '录完执行自定义脚本', 'en': 'Run custom script'}),
         '自定义脚本执行命令': dict(
             type='text', default='', depends_on='是否录制完成后执行自定义脚本',
