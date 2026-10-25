@@ -568,10 +568,17 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         route = unquote(parsed.path)
         query = parse_qs(parsed.query)
+        # 每个请求在这里就把 body 读干净。放在 _handle_api 里不够早：
+        # 有些接口（/api/control/stop、/api/logs/clear）根本不碰 body，
+        # 残留字节会留在 keep-alive 连接里污染下一个请求
+        # ——实测会变成 `{}GET /api/ping` 这种 501 Unsupported method。
+        self._pending_body = None
         try:
             self._check_host()
             self._check_origin()
             self._check_token(query)
+            if method in ('POST', 'PUT', 'DELETE'):
+                self._pending_body = self._read_body()
             if route.startswith('/api/'):
                 self._handle_api(method, route, query)
             elif method == 'GET':
@@ -590,11 +597,10 @@ class ConsoleHandler(BaseHTTPRequestHandler):
 
     def _handle_api(self, method: str, route: str, query: dict):
         app = self.app
-        body_cache = {}
+        # body 已在 _dispatch 里读好，这里直接复用，避免二次读取或残留
+        body_cache = {'value': self._pending_body if self._pending_body is not None else {}}
 
         def body() -> dict:
-            if 'value' not in body_cache:
-                body_cache['value'] = self._read_body() if method in ('POST', 'PUT', 'DELETE') else {}
             return body_cache['value']
 
         def arg(name, default=None, cast=None):

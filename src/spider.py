@@ -717,6 +717,60 @@ async def get_bilibili_stream_data(url: str, qn: str = '10000', platform: str = 
         headers['Cookie'] = cookies
 
     room_id = url.split('?')[0].rsplit('/', maxsplit=1)[1]
+
+    # 优先用新接口：只有它会真正按 qn 返回画质。
+    # 实测同一个房间、同一份 Cookie：旧接口 room/v1/Room/playUrl 即使传 qn=10000，
+    # 也只返回 current_quality=4 的 ~2500kbps 流（720p）；新接口则给 10000（原画 1080p）。
+    params = {
+        "room_id": room_id,
+        "protocol": "0,1",
+        "format": "0,1,2",
+        "codec": "0,1,2",
+        "qn": qn,
+        "platform": platform,
+        "ptype": "8",
+        "dolby": "5",
+        "panorama": "1",
+        "hdr_type": "0,1"
+    }
+    api = f'https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo?{urllib.parse.urlencode(params)}'
+    try:
+        json_str = await async_req(api, proxy_addr=proxy_addr, headers=headers)
+        json_data = json.loads(json_str)
+        if json_data.get('code') != 0:
+            raise LookupError(f"getRoomPlayInfo 返回 code={json_data.get('code')}")
+        data = json_data.get('data') or {}
+        if data.get('live_status') == 0:
+            print("The anchor did not start broadcasting.")
+            return
+        playurl_info = data.get('playurl_info') or {}
+        streams = (playurl_info.get('playurl') or {}).get('stream') or []
+        candidates = []
+        for stream in streams:
+            for fmt in stream.get('format') or []:
+                for codec in fmt.get('codec') or []:
+                    candidates.append(codec)
+        if not candidates:
+            raise LookupError('新接口没有返回可用流')
+
+        # 只保留 avc：HEVC/AV1 在 TS 容器和部分播放器上兼容性差
+        avc_only = [c for c in candidates if c.get('codec_name') == 'avc']
+        pool = avc_only or candidates
+        pool.sort(key=lambda c: c.get('current_qn') or 0, reverse=True)
+
+        available = sorted({c.get('current_qn') for c in pool if c.get('current_qn')}, reverse=True)
+        requested = int(qn) if str(qn).isdigit() else 10000
+        # 取「不超过请求档位的最高一档」，该房间没有原画时自然退到蓝光/超清
+        chosen = next((c for c in pool if (c.get('current_qn') or 0) <= requested), pool[0])
+        logger.info(f"B站可选画质 qn={available}"
+                    f"（30000=杜比 20000=4K 10000=原画 400=蓝光 250=超清 150=高清 80=流畅），"
+                    f"请求 qn={requested}，实际选用 qn={chosen.get('current_qn')}")
+        url_info = (chosen.get('url_info') or [{}])[0]
+        return f"{url_info.get('host', '')}{chosen.get('base_url', '')}{url_info.get('extra', '')}"
+    except Exception as exc:  # noqa: BLE001 - 新接口失败就走旧接口兜底
+        logger.warning(f"B站新接口取流失败（{type(exc).__name__}: {exc}），回退到旧接口")
+
+    # 兜底：旧接口（不保证画质，仅在新接口不可用时使用）
     params = {
         'cid': room_id,
         'qn': qn,
@@ -725,58 +779,17 @@ async def get_bilibili_stream_data(url: str, qn: str = '10000', platform: str = 
     play_api = f'https://api.live.bilibili.com/room/v1/Room/playUrl?{urllib.parse.urlencode(params)}'
     json_str = await async_req(play_api, proxy_addr=proxy_addr, headers=headers)
     json_data = json.loads(json_str)
-    if json_data and json_data['code'] == 0:
-        # 旧接口不保证按 qn 返回，把站点实际给到的画质记下来，方便判断
-        # 「只有 720p」到底是站点限制还是请求没生效。
+    if json_data and json_data.get('code') == 0:
+        data = json_data.get('data') or {}
         logger.info(f"B站旧 playUrl 接口返回：current_quality="
-                    f"{json_data['data'].get('current_quality')} "
-                    f"accept_quality={json_data['data'].get('accept_quality')}")
-        for i in json_data['data']['durl']:
+                    f"{data.get('current_quality')} accept_quality={data.get('accept_quality')}")
+        durl = data.get('durl') or []
+        if not durl:
+            return
+        for i in durl:
             if 'd1--cn-gotcha' in i['url']:
                 return i['url']
-        return json_data['data']['durl'][-1]['url']
-    else:
-        params = {
-            "room_id": room_id,
-            "protocol": "0,1",
-            "format": "0,1,2",
-            "codec": "0,1,2",
-            "qn": qn,
-            "platform": "web",
-            "ptype": "8",
-            "dolby": "5",
-            "panorama": "1",
-            "hdr_type": "0,1"
-        }
-
-        # 此接口因网页上有限制, 需要配置登录后的cookie才能获取最高画质
-        api = f'https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo?{urllib.parse.urlencode(params)}'
-        json_str = await async_req(api, proxy_addr=proxy_addr, headers=headers)
-        json_data = json.loads(json_str)
-        if json_data['data']['live_status'] == 0:
-            print("The anchor did not start broadcasting.")
-            return
-        playurl_info = json_data['data']['playurl_info']
-        format_list = playurl_info['playurl']['stream'][0]['format']
-        stream_data_list = format_list[0]['codec']
-        sorted_stream_list = sorted(stream_data_list, key=itemgetter("current_qn"), reverse=True)
-        # 把 B 站实际给的画质打出来：只有 720p 时，日志能直接看出是「站点只给这些」
-        # 还是「我们的请求/画质映射没生效」。
-        accept_quality = json_data['data'].get('accept_quality') or [
-            item.get('current_qn') for item in sorted_stream_list]
-        logger.info(f"B站可选画质 qn={accept_quality}（30000=杜比 20000=4K 10000=原画 "
-                    f"400=蓝光 250=超清 150=高清 80=流畅），本次请求 qn={qn}")
-        # qn: 30000=杜比 20000=4K 10000=原画 400=蓝光 250=超清 150=高清 80=流畅
-        video_quality_options = {'10000': 0, '400': 1, '250': 2, '150': 3, '80': 4}
-        qn_count = len(sorted_stream_list)
-        select_stream_index = min(video_quality_options[qn], qn_count - 1)
-        stream_data: dict = sorted_stream_list[select_stream_index]
-        logger.info(f"B站实际选用画质 qn={stream_data.get('current_qn')}")
-        base_url = stream_data['base_url']
-        host = stream_data['url_info'][0]['host']
-        extra = stream_data['url_info'][0]['extra']
-        m3u8_url = host + base_url + extra
-        return m3u8_url
+        return durl[-1]['url']
 
 @trace_error_decorator
 async def get_xhs_stream_url(url: str, proxy_addr: OptionalStr = None, cookies: OptionalStr = None) -> dict:
