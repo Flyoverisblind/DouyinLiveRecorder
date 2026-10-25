@@ -747,26 +747,39 @@ async def get_bilibili_stream_data(url: str, qn: str = '10000', platform: str = 
         streams = (playurl_info.get('playurl') or {}).get('stream') or []
         candidates = []
         for stream in streams:
+            proto = stream.get('protocol_name') or ''
             for fmt in stream.get('format') or []:
+                fmt_name = fmt.get('format_name') or ''
                 for codec in fmt.get('codec') or []:
-                    candidates.append(codec)
+                    # 只保留 avc：HEVC/AV1 在 TS 容器和部分播放器上兼容性差
+                    if codec.get('codec_name') != 'avc':
+                        continue
+                    candidates.append({'proto': proto, 'fmt': fmt_name, 'codec': codec})
         if not candidates:
-            raise LookupError('新接口没有返回可用流')
+            raise LookupError('新接口没有返回 avc 流')
+        # 实测 B 站的 FLV（http_stream）CDN 节点经常传几秒就挂住，
+        # 而 HLS 稳定得多；同为 HLS 时优先 ts 分片（与录制容器一致）。
+        proto_rank = {'http_hls': 0, 'http_stream': 1}
+        fmt_rank = {'ts': 0, 'fmp4': 1, 'flv': 2}
 
-        # 只保留 avc：HEVC/AV1 在 TS 容器和部分播放器上兼容性差
-        avc_only = [c for c in candidates if c.get('codec_name') == 'avc']
-        pool = avc_only or candidates
-        pool.sort(key=lambda c: c.get('current_qn') or 0, reverse=True)
-
-        available = sorted({c.get('current_qn') for c in pool if c.get('current_qn')}, reverse=True)
+        available = sorted({c['codec'].get('current_qn') for c in candidates
+                            if c['codec'].get('current_qn')}, reverse=True)
         requested = int(qn) if str(qn).isdigit() else 10000
-        # 取「不超过请求档位的最高一档」，该房间没有原画时自然退到蓝光/超清
-        chosen = next((c for c in pool if (c.get('current_qn') or 0) <= requested), pool[0])
+        # 先按画质筛：取「不超过请求档位的最高一档」，房间没有原画时自然退到蓝光/超清
+        usable = [c for c in candidates
+                  if 0 < (c['codec'].get('current_qn') or 0) <= requested] or candidates
+        best_qn = max((c['codec'].get('current_qn') or 0) for c in usable)
+        usable = [c for c in usable if (c['codec'].get('current_qn') or 0) == best_qn]
+        chosen = sorted(usable, key=lambda c: (proto_rank.get(c['proto'], 9),
+                                               fmt_rank.get(c['fmt'], 9)))[0]
+
         logger.info(f"B站可选画质 qn={available}"
                     f"（30000=杜比 20000=4K 10000=原画 400=蓝光 250=超清 150=高清 80=流畅），"
-                    f"请求 qn={requested}，实际选用 qn={chosen.get('current_qn')}")
-        url_info = (chosen.get('url_info') or [{}])[0]
-        return f"{url_info.get('host', '')}{chosen.get('base_url', '')}{url_info.get('extra', '')}"
+                    f"请求 qn={requested}，选用 qn={best_qn} "
+                    f"via {chosen['proto']}/{chosen['fmt']}")
+        codec_data = chosen['codec']
+        url_info = (codec_data.get('url_info') or [{}])[0]
+        return f"{url_info.get('host', '')}{codec_data.get('base_url', '')}{url_info.get('extra', '')}"
     except Exception as exc:  # noqa: BLE001 - 新接口失败就走旧接口兜底
         logger.warning(f"B站新接口取流失败（{type(exc).__name__}: {exc}），回退到旧接口")
 
