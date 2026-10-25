@@ -26,6 +26,7 @@ import execjs
 import urllib.request
 from . import JS_SCRIPT_PATH, utils
 from .utils import trace_error_decorator, generate_random_string
+from .logger import logger
 from .logger import script_path
 from .room import get_sec_user_id, get_unique_id, UnsupportedUrlError
 from .http_clients.async_http import async_req
@@ -725,6 +726,11 @@ async def get_bilibili_stream_data(url: str, qn: str = '10000', platform: str = 
     json_str = await async_req(play_api, proxy_addr=proxy_addr, headers=headers)
     json_data = json.loads(json_str)
     if json_data and json_data['code'] == 0:
+        # 旧接口不保证按 qn 返回，把站点实际给到的画质记下来，方便判断
+        # 「只有 720p」到底是站点限制还是请求没生效。
+        logger.info(f"B站旧 playUrl 接口返回：current_quality="
+                    f"{json_data['data'].get('current_quality')} "
+                    f"accept_quality={json_data['data'].get('accept_quality')}")
         for i in json_data['data']['durl']:
             if 'd1--cn-gotcha' in i['url']:
                 return i['url']
@@ -754,11 +760,18 @@ async def get_bilibili_stream_data(url: str, qn: str = '10000', platform: str = 
         format_list = playurl_info['playurl']['stream'][0]['format']
         stream_data_list = format_list[0]['codec']
         sorted_stream_list = sorted(stream_data_list, key=itemgetter("current_qn"), reverse=True)
+        # 把 B 站实际给的画质打出来：只有 720p 时，日志能直接看出是「站点只给这些」
+        # 还是「我们的请求/画质映射没生效」。
+        accept_quality = json_data['data'].get('accept_quality') or [
+            item.get('current_qn') for item in sorted_stream_list]
+        logger.info(f"B站可选画质 qn={accept_quality}（30000=杜比 20000=4K 10000=原画 "
+                    f"400=蓝光 250=超清 150=高清 80=流畅），本次请求 qn={qn}")
         # qn: 30000=杜比 20000=4K 10000=原画 400=蓝光 250=超清 150=高清 80=流畅
         video_quality_options = {'10000': 0, '400': 1, '250': 2, '150': 3, '80': 4}
         qn_count = len(sorted_stream_list)
         select_stream_index = min(video_quality_options[qn], qn_count - 1)
         stream_data: dict = sorted_stream_list[select_stream_index]
+        logger.info(f"B站实际选用画质 qn={stream_data.get('current_qn')}")
         base_url = stream_data['base_url']
         host = stream_data['url_info'][0]['host']
         extra = stream_data['url_info'][0]['extra']

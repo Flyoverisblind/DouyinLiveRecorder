@@ -422,6 +422,34 @@ def direct_download_stream(source_url: str, save_path: str, record_name: str, li
         return False
 
 
+_paused_url_cache = {'mtime': None, 'urls': set()}
+
+
+def get_paused_urls() -> set:
+    """读取「已停用」的直播间地址，按文件修改时间缓存，最多每轮读一次文件。
+
+    主循环每「循环监测间隔时间」(默认 300 秒) 才重建一次 url_comments，
+    所以在网页上停用一个直播间后，最多要等 5 分钟才真正停止录制 —— 看起来就像
+    「暂停了还在录」。这里按 mtime 缓存，让停用在 1~2 秒内生效。
+    """
+    try:
+        mtime = os.path.getmtime(url_config_file)
+    except OSError:
+        return _paused_url_cache['urls']
+    if _paused_url_cache['mtime'] != mtime:
+        _paused_url_cache['mtime'] = mtime
+        _paused_url_cache['urls'] = utils.read_paused_urls(url_config_file, text_encoding)
+    return _paused_url_cache['urls']
+
+
+def is_url_paused(url: str) -> bool:
+    """该直播间是否已在配置里被停用（整行以 # 开头）。"""
+    paused = get_paused_urls()
+    if not paused or not url:
+        return False
+    return utils.normalize_live_url(url) in paused
+
+
 def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, save_type: str,
                      script_command: str | None = None) -> bool:
     save_file_path = ffmpeg_command[-1]
@@ -439,8 +467,10 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
         create_var[subs_thread_name].start()
 
     while process.poll() is None:
-        if record_url in url_comments or exit_recording:
-            color_obj.print_colored(f"[{record_name}]录制时已被注释,本条线程将会退出", color_obj.YELLOW)
+        paused = is_url_paused(record_url)
+        if record_url in url_comments or paused or exit_recording:
+            reason = '该直播间已停用,本条线程将会退出' if paused else '录制时已被注释,本条线程将会退出'
+            color_obj.print_colored(f"[{record_name}]{reason}", color_obj.YELLOW)
             clear_record_info(record_name, record_url)
             # process.terminate()
             if os.name == 'nt':

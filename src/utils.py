@@ -204,3 +204,35 @@ def get_query_params(url: str, param_name: OptionalStr) -> dict | list[str]:
         values = query_params.get(param_name, [])
         return values
     
+def normalize_live_url(url: str) -> str:
+    """把直播间地址归一化，便于比较：去掉首尾空白、查询参数和末尾斜杠。"""
+    if not url:
+        return ''
+    return url.strip().split('?')[0].rstrip('/').lower()
+
+
+def read_paused_urls(file_path: str | Path, encoding: str = 'utf-8-sig') -> set:
+    """从 URL_config.ini 里读出所有「已停用」（以 # 开头）的直播间地址。
+
+    行格式为 `画质, 地址, 主播名`，停用就是整行前面加 '#'。
+    返回归一化后的地址集合，方便和正在录制的地址直接比较。
+    """
+    paused = set()
+    try:
+        with open(file_path, 'r', encoding=encoding) as fp:
+            lines = fp.readlines()
+    except OSError:
+        return paused
+    for line in lines:
+        line = line.strip()
+        if not line.startswith('#'):
+            continue
+        body = line.lstrip('#').strip()
+        for part in body.split(','):
+            part = part.strip()
+            if part.lower().startswith('http'):
+                normalized = normalize_live_url(part)
+                if normalized:
+                    paused.add(normalized)
+                break
+    return paused
