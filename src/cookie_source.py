@@ -194,8 +194,8 @@ def read_chromium(db_path: str, user_data: str) -> dict:
         else:
             unsupported += 1        # v20 = 新版 App-Bound 加密
     if not cookies and unsupported:
-        return {'cookies': {}, 'error': f'{unsupported} 条 cookie 使用了 v20（App-Bound）加密，'
-                                        f'本功能无法解密；请改用 Chrome 或 Firefox 登录'}
+        return {'cookies': {}, 'app_bound': True,
+                'error': f'{unsupported} 条 cookie 使用 v20（App-Bound）加密，无法离线解密'}
     return {'cookies': cookies, 'error': ''}
 
 
@@ -227,12 +227,142 @@ def build_cookie_header(cookies: dict) -> str:
     return '; '.join(ordered + extras)
 
 
+# ------------------------------------------------- 通过调试端口（CDP）读取
+#
+# Chromium 运行时会给 cookie 库加**独占锁**，此时任何进程都读不了那个文件。
+# 唯一能在浏览器开着时拿到 cookie 的正规途径是 DevTools 协议：
+# Chrome 启动时带 --remote-debugging-port=9222，就能通过 WebSocket 取到 cookie。
+
+CDP_HOST = '127.0.0.1'
+CDP_COMMON_PORTS = (9222, 9223, 9224, 9333, 9229)
+
+
+def _http_json(url: str, timeout: float = 3.0) -> dict:
+    import urllib.request
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
+        return json.loads(resp.read().decode('utf-8'))
+
+
+def chromium_user_data_dirs() -> list:
+    local = os.environ.get('LOCALAPPDATA', '')
+    roots = [
+        os.path.join(local, 'Google', 'Chrome', 'User Data'),
+        os.path.join(local, 'Microsoft', 'Edge', 'User Data'),
+        os.path.join(local, 'BraveSoftware', 'Brave-Browser', 'User Data'),
+        os.path.join(local, 'Vivaldi', 'User Data'),
+    ]
+    return [root for root in roots if os.path.isdir(root)]
+
+
+def cdp_ports() -> list:
+    """候选调试端口：先看 DevToolsActivePort（浏览器自己写的），再试常见端口。"""
+    ports = []
+    for root in chromium_user_data_dirs():
+        dev = os.path.join(root, 'DevToolsActivePort')
+        if not os.path.exists(dev):
+            continue
+        try:
+            port = int(open(dev, encoding='utf-8').read().splitlines()[0].strip())
+        except (OSError, ValueError, IndexError):
+            continue
+        if port not in ports:
+            ports.append(port)
+    for port in CDP_COMMON_PORTS:
+        if port not in ports:
+            ports.append(port)
+    return ports
+
+
+def _cdp_call(ws, method: str, call_id: int = 1) -> dict:
+    ws.send(json.dumps({'id': call_id, 'method': method}))
+    while True:
+        message = json.loads(ws.recv())
+        if message.get('id') == call_id:
+            return message
+
+
+def read_cdp(browser: str = 'auto', timeout: float = 5.0) -> dict:
+    """尝试通过 DevTools 端口读取 bilibili cookie。
+
+    返回 {'available': bool, 'cookies': dict, 'error': str, 'port': int}
+    available=False 表示该端口没开调试协议（正常情况），不算错误。
+    """
+    try:
+        import websocket          # websocket-client
+    except ImportError:
+        return {'available': False, 'cookies': {},
+                'error': '缺少 websocket-client，无法通过调试端口读取', 'port': 0}
+
+    for port in cdp_ports():
+        try:
+            version = _http_json(f'http://{CDP_HOST}:{port}/json/version', timeout=2.0)
+        except Exception:          # noqa: BLE001 - 端口没开就是没开
+            continue
+        ws_url = version.get('webSocketDebuggerUrl') or ''
+        if not ws_url:
+            continue
+        try:
+            ws = websocket.create_connection(ws_url, timeout=timeout)
+        except Exception as exc:   # noqa: BLE001
+            return {'available': True, 'cookies': {}, 'port': port,
+                    'error': f'连接调试端口 {port} 失败: {exc}'}
+        try:
+            # Storage.getCookies 是浏览器级命令；老版本回退到 Network.getAllCookies
+            message = _cdp_call(ws, 'Storage.getCookies')
+            items = (message.get('result') or {}).get('cookies')
+            if not items:
+                message = _cdp_call(ws, 'Network.getAllCookies', call_id=2)
+                items = (message.get('result') or {}).get('cookies') or []
+        except Exception as exc:   # noqa: BLE001
+            return {'available': True, 'cookies': {}, 'port': port,
+                    'error': f'调试端口 {port} 读取失败: {exc}'}
+        finally:
+            try:
+                ws.close()
+            except Exception:      # noqa: BLE001
+                pass
+
+        cookies = {}
+        for item in items:
+            domain = (item.get('domain') or '').lstrip('.')
+            if BILI_HOST_HINT not in domain:
+                continue
+            name, value = item.get('name'), item.get('value')
+            if name and value is not None:
+                cookies[name] = value
+        if cookies:
+            return {'available': True, 'cookies': cookies,
+                    'error': '', 'port': port}
+        return {'available': True, 'cookies': {}, 'port': port,
+                'error': f'调试端口 {port} 已连接，但里面没有 bilibili cookie'}
+    return {'available': False, 'cookies': {}, 'error': '', 'port': 0}
+
+
 def read_bilibili_cookie(browser: str = 'auto') -> dict:
-    """尝试所有浏览器，返回第一个拿到 SESSDATA 的结果。
+    """读取 B 站 Cookie：先试调试端口（浏览器开着也行），再试各浏览器 cookie 库。
 
     返回 {'ok', 'cookie', 'source', 'error', 'attempts': [...]}
     """
     attempts = []
+
+    # 1) 调试端口：唯一能在浏览器运行时拿到 cookie 的途径
+    if browser in ('auto', 'cdp', 'chromium'):
+        cdp = read_cdp(browser)
+        if cdp.get('available'):
+            cookies = cdp.get('cookies') or {}
+            has_sess = bool(cookies.get('SESSDATA'))
+            attempts.append({'source': f'调试端口 {cdp.get("port")}', 'count': len(cookies),
+                             'has_sessdata': has_sess, 'error': cdp.get('error', ''),
+                             'locked': False})
+            if has_sess:
+                return {'ok': True, 'cookie': build_cookie_header(cookies),
+                        'source': f'调试端口 {cdp.get("port")}', 'error': '',
+                        'attempts': attempts}
+        elif cdp.get('error'):
+            attempts.append({'source': '调试端口', 'count': 0, 'has_sessdata': False,
+                             'error': cdp['error'], 'locked': False})
+
+    # 2) 直接读 cookie 库（浏览器关闭时可用）
     targets = []
     if browser in ('auto', 'chromium'):
         for name, root, profile, db in chromium_candidates():
@@ -250,15 +380,22 @@ def read_bilibili_cookie(browser: str = 'auto') -> dict:
         has_sess = 'SESSDATA' in cookies and cookies['SESSDATA']
         attempts.append({'source': label, 'count': len(cookies),
                          'has_sessdata': has_sess, 'error': info.get('error', ''),
-                         'locked': info.get('locked', False)})
+                         'locked': info.get('locked', False),
+                         'app_bound': info.get('app_bound', False)})
         if has_sess:
             return {'ok': True, 'cookie': build_cookie_header(cookies),
                     'source': label, 'error': '', 'attempts': attempts}
 
-    error = '没有在任何浏览器里找到已登录的 B 站 Cookie'
+    error = '没有找到已登录的 B 站 Cookie'
     locked = [a['source'] for a in attempts if a.get('locked')]
+    app_bound = [a['source'] for a in attempts if a.get('app_bound')]
     if locked:
-        error += f'（{", ".join(locked)} 被浏览器锁定，请关闭后重试）'
+        error += f'（{", ".join(locked)} 的 cookie 库被浏览器独占锁定）'
+    if app_bound:
+        error += (f'（{", ".join(app_bound)} 的 cookie 是 v20 加密，新版 Chrome 无法离线解密）')
+    if locked or app_bound:
+        error += '。解决办法：完全退出 Chrome，双击仓库里的「启动Chrome_带调试端口.bat」' \
+                 '重新打开 Chrome，再点同步——这样不需要解密，浏览器开着也能读。'
     return {'ok': False, 'cookie': '', 'source': '', 'error': error, 'attempts': attempts}
 
 

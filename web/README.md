@@ -301,13 +301,21 @@ B 站对**未登录**的请求只放行 `qn=250`（超清，约 720p），而登
 2. 设置里打开「自动同步B站Cookie」，按需调整「Cookie同步间隔(分钟)」
 3. 也可以用右上角的 **Cookie 图标按钮** 立即同步一次
 
-**能读到哪些浏览器**
+**两条读取路径**
 
-| 浏览器 | 说明 |
-| --- | --- |
-| Chrome / Brave / Vivaldi 等 Chromium | 浏览器**开着也能读**（用共享模式复制 cookie 库，不改动原文件） |
-| Edge | 常**独占锁**住 cookie 库，需要先关闭 Edge |
-| Firefox | `cookies.sqlite` 明文，直接读 |
+1. **调试端口（推荐，浏览器开着也能读）**：Chromium 运行时会**独占锁定** cookie 库，
+   此时任何进程都读不了那个文件。带 `--remote-debugging-port=9222` 启动的 Chrome/Edge
+   会通过 DevTools 协议暴露 cookie，本工具用 `Storage.getCookies` 读取，
+   不需要解密、不受锁定影响。
+   仓库根目录有 `启动Chrome_带调试端口.bat`，双击即可（**需先完全退出 Chrome**，
+   否则参数会被已有实例忽略）。
+2. **直接读 cookie 库（浏览器关闭时）**：Chromium 用 DPAPI + AES-GCM 解密 `v10` 密文；
+   Firefox 的 `cookies.sqlite` 是明文。
+
+| 浏览器 | 开着时 | 关闭时 |
+| --- | --- | --- |
+| Chrome / Edge / Brave / Vivaldi | 仅在开启了调试端口时可用 | ✅ 可读 |
+| Firefox | ✅ 直接可读（无独占锁） | ✅ 可读 |
 
 **安全边界**
 
@@ -315,6 +323,7 @@ B 站对**未登录**的请求只放行 `qn=250`（超清，约 720p），而登
 - 只在 `/x/web-interface/nav` 校验返回 `isLogin=true` 时才写配置
 - 数据不出本机；写入前会自动备份配置
 - 新版 Chrome 的 `v20`（App-Bound）加密无法解密，会明确报错而不是静默失败
+- 调试端口只监听 `127.0.0.1`，不对外网开放；用完可随时关掉 Chrome
 
 命令行也能单独跑：
 
