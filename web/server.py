@@ -430,6 +430,20 @@ class WebConsole:
     def control_stop(self) -> dict:
         return self.recorder.stop()
 
+    def sync_cookie(self) -> dict:
+        """从本机浏览器读取 B 站 Cookie，校验通过后写回 config.ini。"""
+        root = self.project_root
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        try:
+            from src import cookie_source
+        except Exception as exc:  # noqa: BLE001
+            return {'ok': False, 'error': f'无法加载 cookie_source: {exc}'}
+        result = cookie_source.sync(root, 'auto', write=True)
+        if result.get('ok'):
+            result['hint'] = '下次录制（或点「重启」）后生效'
+        return result
+
     def control_restart(self) -> dict:
         env = self.probe.get(force=True)
         if not env['dependencies']['ok']:
@@ -689,6 +703,9 @@ class ConsoleHandler(BaseHTTPRequestHandler):
 
         if route == '/api/control/restart' and method == 'POST':
             return self._json(app.control_restart())
+
+        if route == '/api/cookies/sync' and method == 'POST':
+            return self._json(app.sync_cookie())
 
         # ---------------- 日志
         if route == '/api/logs/stream' and method == 'GET':

@@ -129,7 +129,18 @@ ok_case = 'SMTP邮件服务器' not in push_missing and 'SMTP邮件服务器端�
 print('    大小写不同不判为缺失:', '通过' if ok_case else '失败',
       f'（仍判缺失 {len(push_missing)} 个真正缺失的键）')
 
-if not (ok_dedupe and ok_noop and ok_case):
+# 写入时也必须大小写不敏感：文件里是小写键、调用方传大写键，不能追加出第二条
+case_file = os.path.join(tmpdir, 'case.ini')
+with open(case_file, 'w', encoding='utf-8-sig', newline='') as fp:
+    fp.write('[Cookie]\nb站cookie = old-value\n其它 = 1\n')
+config_store.update_config_file(case_file, {'Cookie': {'B站cookie': 'new-value'}})
+case_text = open(case_file, encoding='utf-8-sig').read()
+ok_write_case = (case_text.count('cookie') == 1
+                 and 'b站cookie = new-value' in case_text
+                 and 'B站cookie' not in case_text)
+print('    大写键写入小写行:', '通过' if ok_write_case else '失败', repr(case_text))
+
+if not (ok_dedupe and ok_noop and ok_case and ok_write_case):
     shutil.rmtree(tmpdir, ignore_errors=True)
     raise SystemExit('配置层自检失败：重复键 / 大小写处理有误')
 

@@ -64,6 +64,8 @@ need_update_line_list = []
 first_run = True
 not_record_list = []
 post_process_queue = None
+# 上次尝试从浏览器同步 B 站 Cookie 的时间戳（main.py 主循环里用）
+_last_cookie_sync = 0.0
 start_display_time = datetime.datetime.now()
 global_proxy = False
 recording_time_list = {}
@@ -1905,6 +1907,28 @@ while True:
                     f"最小文件={auto_post_config['min_size_mb']}MB")
     elif post_process_queue is not None:
         post_process_queue.config = auto_post_config
+
+    # B 站 Cookie 自动同步：未登录时 B 站只给 qn=250（超清，约 720p），
+    # 而登录态失效往往毫无提示，录完才发现画质掉了。
+    auto_cookie_sync = options.get(
+        read_config_value(config, '录制设置', '自动从浏览器同步B站Cookie', "否"), False)
+    cookie_sync_interval = max(
+        5, int(read_config_value(config, '录制设置', 'Cookie同步间隔(分钟)', 60)))
+    if auto_cookie_sync and time.time() - _last_cookie_sync >= cookie_sync_interval * 60:
+        _last_cookie_sync = time.time()
+        try:
+            from src import cookie_source
+            cookie_result = cookie_source.sync(script_path, 'auto', write=True)
+            if cookie_result.get('ok'):
+                if cookie_result.get('written'):
+                    logger.info(f"[Cookie同步] 已从 {cookie_result['source']} 更新 B站cookie"
+                                f"（账号 {cookie_result.get('uname') or '未知'}），下一轮录制生效")
+                else:
+                    logger.info(f"[Cookie同步] B站cookie 已是最新（来源 {cookie_result['source']}）")
+            else:
+                logger.warning(f"[Cookie同步] 失败：{cookie_result.get('error')}")
+        except Exception as cookie_exc:  # noqa: BLE001 - 同步失败不该影响录制
+            logger.warning(f"[Cookie同步] 出错：{cookie_exc}")
     enable_proxy_platform = read_config_value(
         config, '录制设置', '使用代理录制的平台(逗号分隔)',
         'tiktok, soop, pandalive, winktv, flextv, popkontv, twitch, liveme, showroom, chzzk, shopee, shp, youtu, faceit'

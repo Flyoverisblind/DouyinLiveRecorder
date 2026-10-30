@@ -225,6 +225,26 @@ FIELDS = {
                 'en': 'Recordings smaller than this are treated as fragments and skipped.',
             },
         ),
+        '自动从浏览器同步B站Cookie': dict(
+            type='bool', default='否',
+            label={'zh': '自动同步B站Cookie', 'en': 'Auto-sync bilibili cookie'},
+            help={
+                'zh': '定期从本机 Chrome/Edge/Firefox 读取 bilibili.com 的 Cookie，'
+                      '校验有效后写回配置。B 站未登录时只给 720p，Cookie 失效往往悄无声息。'
+                      '前提：浏览器里确实登录着 B 站（Chrome 开着也能读；Edge 需关闭）。',
+                'en': 'Periodically read the bilibili cookie from a local browser, verify it, '
+                      'and write it back. Requires being logged in inside that browser.',
+            },
+        ),
+        'Cookie同步间隔(分钟)': dict(
+            type='int', default=60, min=5, max=1440,
+            depends_on='自动从浏览器同步B站Cookie',
+            label={'zh': 'Cookie同步间隔(分钟)', 'en': 'Cookie sync interval (min)'},
+            help={
+                'zh': '每隔多久检查并同步一次。只在读到「有效且与当前不同」的 Cookie 时才写文件。',
+                'en': 'How often to check. The file is only rewritten when a valid, different cookie is found.',
+            },
+        ),
         '是否录制完成后执行自定义脚本': dict(type='bool', default='否', label={'zh': '录完执行自定义脚本', 'en': 'Run custom script'}),
         '自定义脚本执行命令': dict(
             type='text', default='', depends_on='是否录制完成后执行自定义脚本',

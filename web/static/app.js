@@ -53,6 +53,7 @@ const I18N = {
     navRecording: '录制设置', navPush: '推送配置', navCookie: 'Cookie', navAccount: '账号密码',
     navAuth: '授权令牌', navRuntimeGroup: '运行', navLogs: '实时日志', navFiles: '录制文件',
     start: '启动录制', stop: '停止', recheck: '重新检测', viewAll: '查看全部',
+  cookieSynced: 'Cookie 已同步',
     statMonitoring: '监测中的直播间', statRecording: '正在录制', statErrors: '瞬时错误数', statDisk: '磁盘剩余',
     processCard: '录制进程', envCard: '运行环境', recentFiles: '最近录制的文件',
     kvPid: '进程 ID', kvUptime: '运行时长', kvQuality: '当前画质', kvFormat: '输出格式', kvExit: '上次退出码',
@@ -112,6 +113,7 @@ const I18N = {
     navAccount: 'Accounts', navAuth: 'Authorization', navRuntimeGroup: 'Runtime', navLogs: 'Live log',
     navFiles: 'Recordings',
     start: 'Start', stop: 'Stop', recheck: 'Re-check', viewAll: 'View all',
+  cookieSynced: 'Cookie synced',
     statMonitoring: 'Monitored rooms', statRecording: 'Recording', statErrors: 'Recent errors', statDisk: 'Disk free',
     processCard: 'Recorder process', envCard: 'Environment', recentFiles: 'Recent recordings',
     kvPid: 'PID', kvUptime: 'Uptime', kvQuality: 'Quality', kvFormat: 'Format', kvExit: 'Last exit code',
@@ -1340,6 +1342,20 @@ function bindEvents() {
       toast(t('started'), 'ok');
       setTimeout(refreshState, 800);
     } catch (err) { toast(err.message, 'err'); }
+  };
+  $('#btnSyncCookie').onclick = async () => {
+    const btn = $('#btnSyncCookie');
+    btn.disabled = true;
+    try {
+      const r = await api('/api/cookies/sync', { method: 'POST', body: {} });
+      if (r.ok) {
+        toast(`${t('cookieSynced') || 'Cookie 已同步'}：${r.uname || r.source}`, 'ok');
+        setTimeout(() => { refreshState(); loadConfig(); }, 600);
+      } else {
+        toast(r.error || (S.lang === 'en' ? 'Sync failed' : '同步失败'), 'err');
+      }
+    } catch (err) { toast(err.message, 'err'); }
+    finally { btn.disabled = false; }
   };
   $('#btnRecheck').onclick = async () => { await api('/api/state'); refreshState(); toast(S.lang === 'en' ? 'Refreshed' : '已重新检测', 'ok'); };
   $('#btnOpenFolder').onclick = async () => {

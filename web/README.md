@@ -282,9 +282,46 @@ python web/server.py --open
 | 全局变量区 | 新增 `post_process_queue = None` | 自动后处理队列的句柄（默认关闭时为 None） |
 | 主循环读配置处 | 读取 6 个自动后处理配置项，并按需创建队列 | 配置每轮重读，所以队列只建一次、之后热更新，避免每轮多一个线程 |
 | `check_subprocess()` 录制成功分支 | 录制结束后把文件交给 `post_process_queue.enqueue()` | 真正耗时的检查与编码都在后台线程，不拖慢录制主循环 |
+| 主循环读配置处 | 读取 2 个 Cookie 同步配置项，按间隔调用 `cookie_source.sync()` | B 站 Cookie 失效后会静默降到 720p，自动同步可避免画质悄悄变差 |
 
 > 不带 `DLR_HEADLESS` 时行为与原来完全一致，`python main.py` 照常提示输入地址；
 > 不开「录制完成后自动处理」时，也不会创建任何后台线程。
+
+---
+
+## 4.1 B 站 Cookie 自动同步
+
+B 站对**未登录**的请求只放行 `qn=250`（超清，约 720p），而登录态失效没有任何提示——
+往往录完才发现画质掉了。`源文件 src/cookie_source.py` 会定期从本机浏览器读取
+`bilibili.com` 的 Cookie，**校验通过后**才写回 `config/config.ini`。
+
+**用法**
+
+1. 在浏览器里登录 B 站（保持登录状态）
+2. 设置里打开「自动同步B站Cookie」，按需调整「Cookie同步间隔(分钟)」
+3. 也可以用右上角的 **Cookie 图标按钮** 立即同步一次
+
+**能读到哪些浏览器**
+
+| 浏览器 | 说明 |
+| --- | --- |
+| Chrome / Brave / Vivaldi 等 Chromium | 浏览器**开着也能读**（用共享模式复制 cookie 库，不改动原文件） |
+| Edge | 常**独占锁**住 cookie 库，需要先关闭 Edge |
+| Firefox | `cookies.sqlite` 明文，直接读 |
+
+**安全边界**
+
+- 只读取 `bilibili.com` 相关 cookie，不碰其它站点
+- 只在 `/x/web-interface/nav` 校验返回 `isLogin=true` 时才写配置
+- 数据不出本机；写入前会自动备份配置
+- 新版 Chrome 的 `v20`（App-Bound）加密无法解密，会明确报错而不是静默失败
+
+命令行也能单独跑：
+
+```bash
+python -m src.cookie_source --no-write   # 只检查，不写配置
+python -m src.cookie_source              # 读取→校验→写回
+```
 
 ---
 
@@ -327,13 +364,15 @@ web/
 ├── selftest_config.py  # 配置层自检
 ├── selftest_media.py   # 媒体后处理自检（含无损性验证，无需启动服务）
 ├── selftest_post_process.py # 录完自动处理自检（结束确认、任务分派）
+├── selftest_cookie.py  # B 站 Cookie 同步自检（不联网、不写真实配置）
 ├── selftest_api.py     # 接口自检
 ├── selftest_frontend.py# 前端静态自检（选择器 / 多语言词条）
 ├── selftest_e2e.py     # 端到端自检（真实启停 main.py）
 └── devtools_screenshot.py # 开发辅助：无头浏览器给各页面截图
 
 src/
-└── post_process.py     # 录制结束后的自动后处理队列（结束确认、低优先级、串行）
+├── post_process.py     # 录制结束后的自动后处理队列（结束确认、低优先级、串行）
+└── cookie_source.py    # 从本机浏览器读取 B 站 Cookie、校验并写回配置
 ```
 
 ---
@@ -346,8 +385,9 @@ src/
 python web/selftest_config.py            # 配置读写（无需启动服务）
 python web/selftest_media.py             # 合并/转16:9/压缩 逻辑（含真实 ffmpeg 验证，无需启动服务）
 python web/selftest_post_process.py      # 录完自动处理：结束确认与任务分派（无需启动服务、不需要 ffmpeg）
+python web/selftest_cookie.py            # B 站 Cookie 同步逻辑（不联网、只写临时文件）
 python web/selftest_frontend.py          # 前端静态检查（无需启动服务）
-python web/selftest_api.py --port 8765   # 60 项接口测试（含媒体后处理接口）
+python web/selftest_api.py --port 8765   # 73 项接口测试（含媒体后处理接口）
 python web/selftest_e2e.py --port 8765   # 真实启动/停止 main.py 子进程
 ```
 

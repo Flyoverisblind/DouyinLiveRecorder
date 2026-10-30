@@ -132,21 +132,40 @@ class IniDocument:
                 end = idx
         return start, end
 
+    def _resolve_key(self, section: str, key: str):
+        """按 configparser 的语义（大小写不敏感）找出已存在的真实键名。"""
+        keys = self.key_index.get(section)
+        if not keys:
+            return None
+        if key in keys:
+            return key
+        folded = str(key).casefold()
+        for existing in keys:
+            if str(existing).casefold() == folded:
+                return existing
+        return None
+
     def set_value(self, section: str, key: str, value) -> bool:
-        """写入单个配置项，返回是否发生了实际改动。"""
+        """写入单个配置项，返回是否发生了实际改动。
+
+        键名大小写不敏感：文件里是 `b站cookie` 而调用方传 `B站cookie` 时，
+        必须更新原来那一行，而不是追加一条新键——否则同段出现两个等价键，
+        main.py 会直接抛 DuplicateOptionError 起不来。
+        """
         value = sanitize_value(value)
-        if section in self.key_index and key in self.key_index[section]:
-            idx = self.key_index[section][key]
+        existing_key = self._resolve_key(section, key)
+        if existing_key is not None:
+            idx = self.key_index[section][existing_key]
             raw = self.lines[idx]
             body, eol = split_line_ending(raw)
             eq = body.find('=')
             head = body[:eq + 1]
             rest = body[eq + 1:]
             sep = re.match(r'[ \t]*', rest).group(0) or ' '
-            if self.values[section].get(key) == value:
+            if self.values[section].get(existing_key) == value:
                 return False
             self.lines[idx] = f'{head}{sep}{value}{eol}'
-            self.values[section][key] = value
+            self.values[section][existing_key] = value
             return True
 
         # 新增键：追加到该段末尾（跳过段尾的空行，保持在段内）
