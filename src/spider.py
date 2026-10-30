@@ -704,6 +704,19 @@ async def get_bilibili_room_info(url: str, proxy_addr: OptionalStr = None, cooki
         return {"anchor_name": '', "live_status": False, "room_url": url}
 
 
+async def _bilibili_login_state(headers: dict, proxy_addr: OptionalStr) -> OptionalStr:
+    """查 B 站登录态：True=已登录，False=未登录/失效，None=查询失败。"""
+    try:
+        json_str = await async_req('https://api.bilibili.com/x/web-interface/nav',
+                                   proxy_addr=proxy_addr, headers=headers)
+        data = json.loads(json_str)
+        if data.get('code') == -101:
+            return False
+        return bool((data.get('data') or {}).get('isLogin'))
+    except Exception:
+        return None
+
+
 @trace_error_decorator
 async def get_bilibili_stream_data(url: str, qn: str = '10000', platform: str = 'web', proxy_addr: OptionalStr = None,
                              cookies: OptionalStr = None) -> OptionalStr:
@@ -777,6 +790,17 @@ async def get_bilibili_stream_data(url: str, qn: str = '10000', platform: str = 
                     f"（30000=杜比 20000=4K 10000=原画 400=蓝光 250=超清 150=高清 80=流畅），"
                     f"请求 qn={requested}，选用 qn={best_qn} "
                     f"via {chosen['proto']}/{chosen['fmt']}")
+        # 请求原画却只拿到低档时，明确告警：最常见的原因是 Cookie 失效
+        # （B 站对未登录请求只放行 qn=250 超清），否则用户会静默录到 720p 却毫不知情。
+        if best_qn < requested:
+            logged_in = await _bilibili_login_state(headers, proxy_addr)
+            if logged_in is False:
+                hint = 'Cookie 未登录或已失效，请重新登录 bilibili.com 后更新配置里的「B站cookie」'
+            elif logged_in is True:
+                hint = '账号可能没有该画质权限（如 4K/杜比需要大会员），或主播本身只推这一档'
+            else:
+                hint = '无法确认登录态，请检查「B站cookie」是否有效'
+            logger.warning(f"B站画质降级：请求 qn={requested}，实际只能给 qn={best_qn}。{hint}")
         codec_data = chosen['codec']
         url_info = (codec_data.get('url_info') or [{}])[0]
         return f"{url_info.get('host', '')}{codec_data.get('base_url', '')}{url_info.get('extra', '')}"
