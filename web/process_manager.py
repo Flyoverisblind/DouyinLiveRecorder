@@ -51,6 +51,51 @@ def detect_level(text: str) -> str:
     return 'OUT'
 
 
+def _iter_processes() -> list:
+    """枚举 (pid, ppid, exe_name)，只用 ctypes，不依赖 psutil/pywin32。"""
+    if os.name != 'nt':
+        return []
+    import ctypes
+    from ctypes import wintypes as wt
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ('dwSize', wt.DWORD),
+            ('cntUsage', wt.DWORD),
+            ('th32ProcessID', wt.DWORD),
+            ('th32DefaultHeapID', ctypes.c_size_t),
+            ('th32ModuleID', wt.DWORD),
+            ('cntThreads', wt.DWORD),
+            ('th32ParentProcessID', wt.DWORD),
+            ('pcPriClassBase', ctypes.c_long),
+            ('dwFlags', wt.DWORD),
+            ('szExeFile', wt.WCHAR * 260),
+        ]
+
+    TH32CS_SNAPPROCESS = 0x2
+    k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    k32.CreateToolhelp32Snapshot.argtypes = [wt.DWORD, wt.DWORD]
+    k32.Process32FirstW.argtypes = [ctypes.c_void_p, ctypes.POINTER(PROCESSENTRY32W)]
+    k32.Process32NextW.argtypes = [ctypes.c_void_p, ctypes.POINTER(PROCESSENTRY32W)]
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
+
+    snapshot = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if not snapshot or snapshot == ctypes.c_void_p(-1).value:
+        return []
+    result = []
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        ok = k32.Process32FirstW(snapshot, ctypes.byref(entry))
+        while ok:
+            result.append((entry.th32ProcessID, entry.th32ParentProcessID, entry.szExeFile))
+            ok = k32.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        k32.CloseHandle(snapshot)
+    return result
+
+
 def _pid_alive(pid: int) -> bool:
     """判断 pid 是否还存在（不依赖 psutil）。"""
     if os.name == 'nt':
@@ -116,6 +161,9 @@ class RecorderProcess:
                 return {'ok': False, 'error': '录制进程已在运行中'}
             if not os.path.isfile(os.path.join(self.project_root, 'main.py')):
                 return {'ok': False, 'error': f'未找到 main.py：{self.project_root}'}
+
+            # 上一次残留的 ffmpeg 会继续往文件里写，先清掉再启动
+            self._kill_orphan_ffmpeg()
 
             env = os.environ.copy()
             env['DLR_HEADLESS'] = '1'          # 关闭清屏与交互式 input
@@ -189,6 +237,7 @@ class RecorderProcess:
         控制台若被强制关闭（或关窗口时没走停止流程），main.py 会活下来成为孤儿：
         它的 stdout 管道已断，会不停刷 Errno 22，而且会和新的录制进程**重复录同一场直播**。
         """
+        self._kill_orphan_ffmpeg()
         path = self._pid_file()
         if not os.path.isfile(path):
             return {'killed': False}
@@ -205,6 +254,26 @@ class RecorderProcess:
         self._emit('SYS', f'已清理上一次遗留的录制进程 (PID {pid})', level='WARNING')
         return {'killed': True, 'pid': pid}
 
+    def _kill_orphan_ffmpeg(self) -> int:
+        """结束「父进程已死」的 ffmpeg。
+
+        点停止时控制台只结束了 python，ffmpeg 是独立进程，python 一死它就被
+        挂到已退出的父进程上继续写文件 —— 表现就是「点了停止还在录」。
+        这里按「父进程是否存活」判断并清理。
+        """
+        killed = []
+        for pid, ppid, name in _iter_processes():
+            if name.lower() != 'ffmpeg.exe':
+                continue
+            if ppid and _pid_alive(ppid):
+                continue
+            self._terminate_tree(pid, force=True)
+            killed.append(pid)
+        if killed:
+            self._emit('SYS', f'已清理 {len(killed)} 个孤儿 ffmpeg（PID {", ".join(map(str, killed))}）',
+                       level='WARNING')
+        return len(killed)
+
     # ------------------------------------------------------------ 停止
     def stop(self, timeout: float = 2.5) -> dict:
         """停止录制进程。
@@ -215,10 +284,18 @@ class RecorderProcess:
         with self._lock:
             proc = self._proc
             if proc is None or proc.poll() is not None:
-                return {'ok': True, 'already_stopped': True}
-            pid = proc.pid
-            self.user_stopped = True
-            self._emit('SYS', f'正在停止录制进程 (PID {pid}) ...', level='WARNING')
+                already = True
+            else:
+                already = False
+                pid = proc.pid
+                self.user_stopped = True
+                self._emit('SYS', f'正在停止录制进程 (PID {pid}) ...', level='WARNING')
+
+        if already:
+            # python 已经不在了，但它派生的 ffmpeg 可能还活着继续写文件
+            self._kill_orphan_ffmpeg()
+            self._remove_pid_file()
+            return {'ok': True, 'already_stopped': True}
 
         self._terminate_tree(pid, force=False)
         deadline = time.time() + timeout
@@ -234,6 +311,8 @@ class RecorderProcess:
                 proc.wait(timeout=6)
             except subprocess.TimeoutExpired:
                 pass
+        # 兜底：进程树里漏掉的 ffmpeg（父进程已死）也要清掉，否则文件会继续变大
+        self._kill_orphan_ffmpeg()
         with self._lock:
             self.stopped_at = time.time()
             self._emit('SYS', f'录制进程已停止，退出码 {proc.poll()}', level='INFO')
