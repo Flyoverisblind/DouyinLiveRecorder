@@ -1205,6 +1205,12 @@ def main():
     app.ensure_url_file()
     app.ensure_schema_keys()
     app.ensure_dirs()
+    # 上一次控制台若被强制关闭，main.py 可能变成孤儿：它既会重复录同一场直播，
+    # 又因为 stdout 管道已断而无限刷 Errno 22。启动时先清掉。
+    try:
+        app.recorder.cleanup_stale()
+    except Exception:
+        pass
 
     server = ConsoleServer((args.host, port), ConsoleHandler, app, token=args.token)
     url = f'http://{"127.0.0.1" if args.host in ("0.0.0.0", "") else args.host}:{port}/'

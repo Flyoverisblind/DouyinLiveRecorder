@@ -66,6 +66,21 @@ not_record_list = []
 post_process_queue = None
 # 上次尝试从浏览器同步 B 站 Cookie 的时间戳（main.py 主循环里用）
 _last_cookie_sync = 0.0
+
+
+def _stdout_broken(exc: BaseException) -> bool:
+    """判断异常是不是「控制台没了、stdout 管道已断」。
+
+    Windows 上往已关闭的管道写数据会抛 OSError(22, EINVAL) 或
+    OSError(32, EPIPE)/BrokenPipeError。控制台重启、或用户关掉窗口后，
+    录制进程会陷入「打印失败 -> 记日志 -> 日志也失败」的死循环，
+    必须直接退出，交给控制台重新拉起。
+    """
+    if not headless_mode:
+        return False
+    if isinstance(exc, BrokenPipeError):
+        return True
+    return isinstance(exc, OSError) and getattr(exc, 'errno', None) in (22, 32, 109, 232)
 start_display_time = datetime.datetime.now()
 global_proxy = False
 recording_time_list = {}
@@ -138,6 +153,10 @@ def display_info() -> None:
                 print("x" * 60)
                 start_display_time = now_time
         except Exception as e:
+            if _stdout_broken(e):
+                # 控制台已退出/重启，stdout 管道断了：再打印只会无限刷 Errno 22，
+                # 直接退出，让控制台重新拉起干净的进程。
+                os._exit(1)
             logger.error(f"错误信息: {e} 发生错误的行数: {e.__traceback__.tb_lineno}")
 
 
@@ -2246,6 +2265,8 @@ while True:
         first_start = False
 
     except Exception as err:
+        if _stdout_broken(err):
+            os._exit(1)
         logger.error(f"错误信息: {err} 发生错误的行数: {err.__traceback__.tb_lineno}")
 
     if first_run:

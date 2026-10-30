@@ -51,6 +51,26 @@ def detect_level(text: str) -> str:
     return 'OUT'
 
 
+def _pid_alive(pid: int) -> bool:
+    """判断 pid 是否还存在（不依赖 psutil）。"""
+    if os.name == 'nt':
+        import ctypes
+        SYNCHRONIZE = 0x00100000
+        handle = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+        if not handle:
+            return False
+        try:
+            # WAIT_TIMEOUT(0x102) 表示进程还活着
+            return ctypes.windll.kernel32.WaitForSingleObject(handle, 0) == 0x102
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
 class RecorderProcess:
     """包装 main.py 子进程。"""
 
@@ -140,9 +160,50 @@ class RecorderProcess:
                     (None if key == 'free_space' else '')
 
             self._emit('SYS', f'已启动录制进程 (PID {self._proc.pid})：{" ".join(cmd)}', level='INFO')
+            self._write_pid_file(self._proc.pid)
             self._reader = threading.Thread(target=self._read_loop, args=(self._proc,), daemon=True)
             self._reader.start()
             return {'ok': True, 'pid': self._proc.pid}
+
+    # ------------------------------------------------------------ pid 文件
+    def _pid_file(self) -> str:
+        return os.path.join(self.project_root, 'logs', 'recorder.pid')
+
+    def _write_pid_file(self, pid: int) -> None:
+        try:
+            os.makedirs(os.path.join(self.project_root, 'logs'), exist_ok=True)
+            with open(self._pid_file(), 'w', encoding='utf-8') as fp:
+                fp.write(str(pid))
+        except OSError:
+            pass
+
+    def _remove_pid_file(self) -> None:
+        try:
+            os.remove(self._pid_file())
+        except OSError:
+            pass
+
+    def cleanup_stale(self) -> dict:
+        """清理上一次控制台遗留的录制进程（本次控制台还没启动任何进程时调用）。
+
+        控制台若被强制关闭（或关窗口时没走停止流程），main.py 会活下来成为孤儿：
+        它的 stdout 管道已断，会不停刷 Errno 22，而且会和新的录制进程**重复录同一场直播**。
+        """
+        path = self._pid_file()
+        if not os.path.isfile(path):
+            return {'killed': False}
+        try:
+            pid = int(open(path, encoding='utf-8').read().strip())
+        except (OSError, ValueError):
+            self._remove_pid_file()
+            return {'killed': False}
+        if pid <= 0 or not _pid_alive(pid):
+            self._remove_pid_file()
+            return {'killed': False}
+        self._terminate_tree(pid, force=True)
+        self._remove_pid_file()
+        self._emit('SYS', f'已清理上一次遗留的录制进程 (PID {pid})', level='WARNING')
+        return {'killed': True, 'pid': pid}
 
     # ------------------------------------------------------------ 停止
     def stop(self, timeout: float = 2.5) -> dict:
@@ -176,6 +237,7 @@ class RecorderProcess:
         with self._lock:
             self.stopped_at = time.time()
             self._emit('SYS', f'录制进程已停止，退出码 {proc.poll()}', level='INFO')
+        self._remove_pid_file()
         return {'ok': True, 'exit_code': proc.poll()}
 
     @staticmethod
