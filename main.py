@@ -65,6 +65,36 @@ first_run = True
 not_record_list = []
 post_process_queue = None
 
+# 距离直播流地址签名过期多少秒时，主动收尾并重取地址续录
+EXPIRY_REFRESH_MARGIN = 90
+_immediate_rerecord = False
+
+
+def request_immediate_rerecord() -> None:
+    """标记「下一次循环不要等待，立刻重取地址续录」。"""
+    global _immediate_rerecord
+    _immediate_rerecord = True
+
+
+def stream_url_expires(url: str):
+    """从直播流地址解析签名过期时间（epoch 秒）。解析不到返回 None。
+
+    B 站形如 `...&expires=1793949256&...`（实测有效期 1 小时），
+    抖音等平台可能用 expire / txExpire。
+    """
+    if not url:
+        return None
+    for name in ('expires', 'expire', 'txExpire', 'tx_expire'):
+        match = re.search(rf'[?&]{name}=(\d{{9,13}})', url, re.IGNORECASE)
+        if not match:
+            continue
+        value = int(match.group(1))
+        if value > 10 ** 12:          # 毫秒时间戳
+            value //= 1000
+        if 10 ** 9 < value < 10 ** 11:
+            return float(value)
+    return None
+
 
 def _stdout_broken(exc: BaseException) -> bool:
     """判断异常是不是「控制台没了、stdout 管道已断」。
@@ -79,6 +109,8 @@ def _stdout_broken(exc: BaseException) -> bool:
     if isinstance(exc, BrokenPipeError):
         return True
     return isinstance(exc, OSError) and getattr(exc, 'errno', None) in (22, 32, 109, 232)
+
+
 start_display_time = datetime.datetime.now()
 global_proxy = False
 recording_time_list = {}
@@ -485,7 +517,22 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
         create_var[subs_thread_name].daemon = True
         create_var[subs_thread_name].start()
 
+    expires_at = stream_url_expires(record_url)
     while process.poll() is None:
+        # 直播流地址大多带签名有效期（B 站是 1 小时）。到期后 ffmpeg 会直接断流，
+        # 表现就是「录着录着自己停了」。提前一点点主动收尾并立即重取地址续录，
+        # 只会丢 1~2 秒，而不是等地址彻底失效后被踢掉。
+        if expires_at and expires_at > time.time() >= expires_at - EXPIRY_REFRESH_MARGIN:
+            logger.info(f"[{record_name}]直播流地址即将过期，主动刷新并续录")
+            request_immediate_rerecord()
+            if os.name == 'nt':
+                if process.stdin:
+                    process.stdin.write(b'q')
+                    process.stdin.close()
+            else:
+                process.send_signal(signal.SIGINT)
+            process.wait()
+            return False
         paused = is_url_paused(record_url)
         if record_url in url_comments or paused or exit_recording:
             reason = '该直播间已停用,本条线程将会退出' if paused else '录制时已被注释,本条线程将会退出'
@@ -613,6 +660,7 @@ def select_source_url(link, stream_info):
 
 def start_record(url_data: tuple, count_variable: int = -1) -> None:
     global error_count
+    global _immediate_rerecord
 
     while True:
         try:
@@ -1372,6 +1420,7 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                                         )
                                         if comment_end:
                                             return
+                                        record_finished = True
 
                                     except subprocess.CalledProcessError as e:
                                         logger.error(f"错误信息: {e} 发生错误的行数: {e.__traceback__.tb_lineno}")
@@ -1464,6 +1513,7 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                                         )
                                         if comment_end:
                                             return
+                                        record_finished = True
 
                                     except subprocess.CalledProcessError as e:
                                         logger.error(f"错误信息: {e} 发生错误的行数: {e.__traceback__.tb_lineno}")
@@ -1538,6 +1588,7 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                                         )
                                         if comment_end:
                                             return
+                                        record_finished = True
 
                                     except subprocess.CalledProcessError as e:
                                         logger.error(f"错误信息: {e} 发生错误的行数: {e.__traceback__.tb_lineno}")
@@ -1585,6 +1636,7 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                                         )
                                         if comment_end:
                                             return
+                                        record_finished = True
 
                                     except subprocess.CalledProcessError as e:
                                         logger.error(f"错误信息: {e} 发生错误的行数: {e.__traceback__.tb_lineno}")
@@ -1619,6 +1671,7 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                                                 record_save_type,
                                                 custom_script
                                             )
+                                            record_finished = True
                                             if comment_end:
                                                 if converts_to_mp4:
                                                     file_paths = utils.get_file_paths(os.path.dirname(save_file_path))
@@ -1663,6 +1716,7 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                                                 record_save_type,
                                                 custom_script
                                             )
+                                            record_finished = True
                                             if comment_end:
                                                 threading.Thread(
                                                     target=converts_mp4, args=(save_file_path, delete_origin_file)
@@ -1692,9 +1746,14 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                     x = x + 60
                     color_obj.print_colored("\r瞬时错误太多,延迟加60秒", color_obj.YELLOW)
 
-                # 这里是.如果录制结束后,循环时间会暂时变成30s后检测一遍. 这样一定程度上防止主播卡顿造成少录
+                # 直播流地址快过期时会主动收尾，这里不等直接重取地址续录，
+                # 把断流空窗从几秒压到最短。
+                if _immediate_rerecord:
+                    _immediate_rerecord = False
+                    x = 0
+                # 如果录制结束后,循环时间会暂时变成30s后检测一遍. 这样一定程度上防止主播卡顿造成少录
                 # 当30秒过后检测一遍后. 会回归正常设置的循环秒数
-                if record_finished:
+                elif record_finished:
                     count_time_end = time.time() - count_time
                     if count_time_end < 60:
                         x = 30
