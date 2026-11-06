@@ -35,6 +35,7 @@ import media_jobs            # noqa: E402
 import media_tools           # noqa: E402
 import paths                 # noqa: E402
 from process_manager import EnvironmentProbe, RecorderProcess  # noqa: E402
+import process_manager        # noqa: E402  （单实例检查用 _pid_alive）
 import schema as schema_mod  # noqa: E402
 
 STATIC_DIR = os.path.join(WEB_DIR, 'static')
@@ -1168,6 +1169,33 @@ def remove_pid_file(path: str) -> None:
         pass
 
 
+def _running_console_url(project_root: str) -> str:
+    """如果已有控制台在运行并响应，返回它的访问地址；否则返回空串。"""
+    import urllib.request
+    path = os.path.join(project_root, PID_FILE_REL)
+    try:
+        with open(path, encoding='utf-8') as fp:
+            lines = [line.strip() for line in fp if line.strip()]
+        pid, port = int(lines[0]), int(lines[1])
+    except (OSError, ValueError, IndexError):
+        return ''
+    # 先确认 pid 还活着（避免 pid 复用误判），再确认端口确实在提供接口
+    try:
+        alive = process_manager._pid_alive(pid)
+    except Exception:
+        alive = False
+    if not alive:
+        return ''
+    url = f'http://127.0.0.1:{port}/api/ping'
+    try:
+        with urllib.request.urlopen(url, timeout=2) as resp:
+            if resp.status != 200:
+                return ''
+    except Exception:
+        return ''
+    return f'http://127.0.0.1:{port}/'
+
+
 def main():
     parser = argparse.ArgumentParser(description='DouyinLiveRecorder 可视化控制台')
     parser.add_argument('--host', default='127.0.0.1', help='监听地址，默认 127.0.0.1（仅本机可访问）')
@@ -1180,6 +1208,21 @@ def main():
 
     project_root = os.path.abspath(args.project_root)
     ensure_std_streams(project_root)      # pythonw 后台模式没有控制台，先把输出接住
+
+    # 单实例保护：已经有一个控制台在跑时，不要再起第二个。
+    # 第二个实例会把自己当成「接管者」，清理掉正在运行的录制进程
+    # （recorder.pid 是全局的），表现就是「软件自己停止了」。
+    existing = _running_console_url(project_root)
+    if existing:
+        print('=' * 62)
+        print('  检测到控制台已在运行，本次不再启动新实例')
+        print(f'  已有地址: {existing}')
+        print('  如需重启，请先运行「停止控制台_后台.bat」')
+        print('=' * 62)
+        if args.open and os.environ.get('DLR_NO_BROWSER') != '1':
+            webbrowser.open(existing)
+        return
+
     python_exe = args.python or paths.pick_python(project_root)
     port = find_free_port(args.host, args.port)
 

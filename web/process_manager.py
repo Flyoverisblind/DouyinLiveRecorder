@@ -116,6 +116,14 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+def _parent_pid(pid: int) -> int:
+    """取父进程 PID（只依赖 ctypes，查不到返回 0）。"""
+    for child, parent, _name in _iter_processes():
+        if child == pid:
+            return parent
+    return 0
+
+
 class RecorderProcess:
     """包装 main.py 子进程。"""
 
@@ -136,6 +144,11 @@ class RecorderProcess:
         self.exit_code = None
         self.last_start_error = ''
         self.user_stopped = False
+        # 异常退出后自动拉起：进程若在没有点「停止」的情况下退出，控制台会在几秒后
+        # 重新启动它，避免「软件自己停了」而没人发现。
+        self.auto_restart = True
+        self._restart_attempts = 0
+        self._restarting = False
         self.stats = {
             'monitoring': 0,
             'recording_count': 0,
@@ -209,6 +222,7 @@ class RecorderProcess:
 
             self._emit('SYS', f'已启动录制进程 (PID {self._proc.pid})：{" ".join(cmd)}', level='INFO')
             self._write_pid_file(self._proc.pid)
+            self._log_event(f'启动录制进程 PID {self._proc.pid}')
             self._reader = threading.Thread(target=self._read_loop, args=(self._proc,), daemon=True)
             self._reader.start()
             return {'ok': True, 'pid': self._proc.pid}
@@ -231,6 +245,22 @@ class RecorderProcess:
         except OSError:
             pass
 
+    # ------------------------------------------------------------ 事件日志
+    def _event_log_path(self) -> str:
+        return os.path.join(self.project_root, 'logs', 'recorder_events.log')
+
+    def _log_event(self, message: str) -> None:
+        """把录制进程的启停写进独立文件，方便事后查「它到底为什么停了」。
+
+        控制台的日志缓冲区只有 4000 行（二十来分钟就滚完），历史证据留不住。
+        """
+        try:
+            os.makedirs(os.path.join(self.project_root, 'logs'), exist_ok=True)
+            with open(self._event_log_path(), 'a', encoding='utf-8') as fp:
+                fp.write(f'{time.strftime("%Y-%m-%d %H:%M:%S")} | {message}\n')
+        except OSError:
+            pass
+
     def cleanup_stale(self) -> dict:
         """清理上一次控制台遗留的录制进程（本次控制台还没启动任何进程时调用）。
 
@@ -249,9 +279,16 @@ class RecorderProcess:
         if pid <= 0 or not _pid_alive(pid):
             self._remove_pid_file()
             return {'killed': False}
+        # 关键：如果这个录制进程的父进程还活着，说明它属于**另一个仍在运行的控制台**，
+        # 绝不能动——否则重复启动一次控制台，就会把正在跑的录制杀掉（表现为「自己停止」）。
+        parent = _parent_pid(pid)
+        if parent and _pid_alive(parent):
+            self._log_event(f'跳过后台清理：PID {pid} 的父进程 {parent} 仍存活')
+            return {'killed': False, 'skipped': True}
         self._terminate_tree(pid, force=True)
         self._remove_pid_file()
         self._emit('SYS', f'已清理上一次遗留的录制进程 (PID {pid})', level='WARNING')
+        self._log_event(f'清理遗留录制进程 PID {pid}')
         return {'killed': True, 'pid': pid}
 
     def _kill_orphan_ffmpeg(self) -> int:
@@ -371,11 +408,51 @@ class RecorderProcess:
             with self._lock:
                 self.exit_code = code
                 self.stopped_at = time.time()
-                if self.user_stopped:
+                user_stopped = self.user_stopped
+                uptime = (time.time() - self.started_at) if self.started_at else 0
+                if user_stopped:
                     level = 'INFO'
                 else:
                     level = 'INFO' if code == 0 else 'ERROR'
                 self._emit('SYS', f'录制进程已退出，退出码 {code}', level=level)
+                if uptime >= 600:
+                    self._restart_attempts = 0     # 稳定跑过 10 分钟就重置计数
+                need_restart = (not user_stopped and self.auto_restart
+                                and self._restart_attempts < 5)
+            self._log_event(f'录制进程退出 code={code} 主动停止={user_stopped} '
+                            f'运行时长={int(uptime)}s 自动重启={need_restart}')
+            if need_restart:
+                self._schedule_restart(code)
+
+    def _schedule_restart(self, exit_code) -> None:
+        """录制进程在没人点停止的情况下退出：等几秒自动拉起。"""
+        with self._lock:
+            if self._restarting:
+                return
+            self._restarting = True
+            self._restart_attempts += 1
+            attempt = self._restart_attempts
+        self._emit('SYS', f'录制进程异常退出（退出码 {exit_code}），5 秒后自动重启'
+                          f'（第 {attempt}/5 次）', level='WARNING')
+        self._log_event(f'计划自动重启（第 {attempt} 次）')
+
+        def worker():
+            try:
+                time.sleep(5)
+                with self._lock:
+                    if self.user_stopped:
+                        self._log_event('取消自动重启：已被用户停止')
+                        return
+                result = self.start()
+                self._log_event(f'自动重启结果: ok={result.get("ok")} '
+                                f'pid={result.get("pid")} {result.get("error", "")}')
+                if not result.get('ok'):
+                    self._emit('SYS', f'自动重启失败: {result.get("error")}', level='ERROR')
+            finally:
+                with self._lock:
+                    self._restarting = False
+
+        threading.Thread(target=worker, daemon=True, name='recorder-restart').start()
 
     @staticmethod
     def _split_chunk(chunk: str):
