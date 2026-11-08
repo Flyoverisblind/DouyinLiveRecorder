@@ -501,7 +501,7 @@ def is_url_paused(url: str) -> bool:
     return utils.normalize_live_url(url) in paused
 
 
-def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, save_type: str,
+def _check_subprocess_once(record_name: str, record_url: str, ffmpeg_command: list, save_type: str,
                      script_command: str | None = None) -> bool:
     save_file_path = ffmpeg_command[-1]
     process = subprocess.Popen(
@@ -604,6 +604,46 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
     recording.discard(record_name)
     return False
 
+
+
+# 首次连接就失败时的重试参数。B 站 CDN 偶发返回 EOF，而 ffmpeg 的
+# -reconnect_* 只处理「录到一半断流」，首次打开失败会直接退出。
+OPEN_RETRIES = 3
+OPEN_FAIL_WINDOW = 20      # 秒：短于这个时长就退出，视为「没真正录上」
+OPEN_RETRY_DELAY = 3       # 秒
+
+
+def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, save_type: str,
+                     script_command: str | None = None) -> bool:
+    """录制一段直播；首次打开流就失败时自动重试。
+
+    实测日志：
+      [in#0] Error opening input: End of file
+      Error opening input file https://...m3u8?...suffix=origin
+      -> 直播录制出错,返回码: 3753488571
+    该地址当时并没有过期（有效期还剩 1 小时），重新取流也能正常返回，
+    所以是 CDN 的瞬时抖动，第二次尝试基本都能成功。
+    """
+    result = False
+    for attempt in range(OPEN_RETRIES + 1):
+        started_at = time.time()
+        result = _check_subprocess_once(
+            record_name, record_url, ffmpeg_command, save_type, script_command)
+        elapsed = time.time() - started_at
+        # 只重试「很快就失败」的情况；正常结束、用户停止/暂停、地址到期换流都不重试
+        first_open_failed = (
+            result is False
+            and attempt < OPEN_RETRIES
+            and elapsed < OPEN_FAIL_WINDOW
+            and not exit_recording
+            and not is_url_paused(record_url)
+        )
+        if not first_open_failed:
+            return result
+        logger.warning(f"[{record_name}] 直播流打开失败（{elapsed:.1f} 秒后退出），"
+                       f"{OPEN_RETRY_DELAY} 秒后重试（第 {attempt + 1}/{OPEN_RETRIES} 次）")
+        time.sleep(OPEN_RETRY_DELAY)
+    return result
 
 def clean_name(input_text):
     cleaned_name = re.sub(rstr, "_", input_text.strip()).strip('_')
