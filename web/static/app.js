@@ -294,6 +294,66 @@ function closeModal() {
   $('#modalMask').classList.add('hidden');
   $('#modalBody').innerHTML = '';
   $('#modalFoot').innerHTML = '';
+  stopQrPoll();
+}
+
+// ---------------------------------------------------------------- B 站扫码登录
+let qrPollTimer = null;
+
+function stopQrPoll() {
+  if (qrPollTimer) { clearInterval(qrPollTimer); qrPollTimer = null; }
+}
+
+async function startBiliQrLogin() {
+  const en = S.lang === 'en';
+  stopQrPoll();
+
+  const render = (image, text) => {
+    openModal(
+      en ? 'Sign in to Bilibili' : '扫码登录 B 站',
+      `<div style="display:flex;flex-direction:column;align-items:center;gap:12px">
+         <img src="${image}" alt="QR" style="width:220px;height:220px;background:#fff;padding:10px;border-radius:10px">
+         <div id="qrStatus" style="font-size:13px;opacity:.85;text-align:center">${text}</div>
+       </div>`,
+      `<button class="btn ghost" id="qrRefresh">${en ? 'Refresh' : '刷新二维码'}</button>
+       <button class="btn" id="qrClose">${en ? 'Close' : '关闭'}</button>`,
+    );
+    $('#qrClose').onclick = () => closeModal();
+    $('#qrRefresh').onclick = () => startBiliQrLogin();
+  };
+
+  let info;
+  try {
+    info = await api('/api/login/bilibili/qrcode', { method: 'POST', body: {} });
+  } catch (err) { toast(err.message, 'err'); return; }
+  if (!info || !info.ok) { toast((info && info.error) || (en ? 'Failed to create QR' : '生成二维码失败'), 'err'); return; }
+
+  render(info.image, en ? 'Scan with the Bilibili app' : '请用手机 B 站 App 扫码');
+
+  qrPollTimer = setInterval(async () => {
+    let r = null;
+    try {
+      r = await api(`/api/login/bilibili/poll?key=${encodeURIComponent(info.key)}`);
+    } catch (err) { return; }
+    const status = $('#qrStatus');
+    if (!r) return;
+    if (r.state === 'waiting') {
+      if (status) status.textContent = en ? 'Waiting for scan…' : '等待扫码…';
+    } else if (r.state === 'scanned') {
+      if (status) status.textContent = en ? 'Scanned — confirm on your phone' : '已扫码，请在手机上点确认';
+    } else if (r.state === 'expired') {
+      stopQrPoll();
+      if (status) status.textContent = en ? 'QR expired — click refresh' : '二维码已失效，请点「刷新二维码」';
+    } else if (r.state === 'success') {
+      stopQrPoll();
+      closeModal();
+      toast((en ? 'Signed in as ' : '登录成功：') + (r.uname || ''), 'ok');
+      setTimeout(() => { loadConfig(); refreshState(); }, 500);
+    } else {
+      stopQrPoll();
+      if (status) status.textContent = r.error || (en ? 'Failed' : '登录失败');
+    }
+  }, 2000);
 }
 
 function confirmDialog(message) {
@@ -1333,6 +1393,7 @@ function bindEvents() {
       setTimeout(refreshState, 500);
     } catch (err) { toast(err.message, 'err'); }
   };
+  $('#btnQrLogin').onclick = () => startBiliQrLogin();
   $('#btnRestart').onclick = async () => {
     if (!await confirmDialog(t('confirmStop'))) return;
     try {

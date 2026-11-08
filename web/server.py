@@ -29,6 +29,7 @@ WEB_DIR = os.path.dirname(os.path.abspath(__file__))
 if WEB_DIR not in sys.path:
     sys.path.insert(0, WEB_DIR)
 
+import bili_login             # noqa: E402
 import config_store          # noqa: E402
 import files_api             # noqa: E402
 import media_jobs            # noqa: E402
@@ -431,6 +432,21 @@ class WebConsole:
     def control_stop(self) -> dict:
         return self.recorder.stop()
 
+    def start_bili_qr(self) -> dict:
+        """申请 B 站扫码登录二维码。"""
+        return bili_login.generate()
+
+    def poll_bili_qr(self, key: str) -> dict:
+        """轮询扫码状态；成功后把 Cookie 写回 config.ini。"""
+        result = bili_login.poll(key)
+        if result.get('state') == 'success':
+            written = bili_login.write_cookie(self.config_file, result.get('cookie', ''))
+            if not written.get('ok'):
+                return {'ok': False, 'state': 'failed', 'error': written.get('error')}
+            result['written'] = written.get('changed', [])
+        result.pop('cookie', None)      # 不把完整 Cookie 回传给前端
+        return result
+
     def control_restart(self) -> dict:
         env = self.probe.get(force=True)
         if not env['dependencies']['ok']:
@@ -690,6 +706,12 @@ class ConsoleHandler(BaseHTTPRequestHandler):
 
         if route == '/api/control/restart' and method == 'POST':
             return self._json(app.control_restart())
+
+        if route == '/api/login/bilibili/qrcode' and method == 'POST':
+            return self._json(app.start_bili_qr())
+
+        if route == '/api/login/bilibili/poll' and method == 'GET':
+            return self._json(app.poll_bili_qr(str(arg('key', '') or '')))
 
         # ---------------- 日志
         if route == '/api/logs/stream' and method == 'GET':

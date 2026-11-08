@@ -284,9 +284,40 @@ python web/server.py --open
 | `check_subprocess()` 录制成功分支 | 录制结束后把文件交给 `post_process_queue.enqueue()` | 真正耗时的检查与编码都在后台线程，不拖慢录制主循环 |
 | `check_subprocess()` 等待循环 | 新增流地址到期检测：到期前 90 秒主动收尾并置「立即重录」标记 | B 站签名地址只有 1 小时有效期，到期后 ffmpeg 会直接断流，表现为「录着录着自己停了」 |
 | 每个平台的录制调用点 | 录制结束后置 `record_finished = True` | 原来只有抖音分支置位，「30 秒快速复检」是死代码，断流后要等满一个循环（默认 300 秒）才重录 |
+| `check_subprocess()` 外层 | 包装成「首次连接失败自动重试」（20 秒内非 0 退出则重试，最多 3 次） | ffmpeg 的 `-reconnect_*` 只处理读流中断，首次打开失败会直接退出，CDN 抖一下就丢一整段 |
 
 > 不带 `DLR_HEADLESS` 时行为与原来完全一致，`python main.py` 照常提示输入地址；
 > 不开「录制完成后自动处理」时，也不会创建任何后台线程。
+
+---
+
+## 4.1 扫码登录 B 站（自动获取 Cookie）
+
+B 站对未登录请求只放行 `qn=250`（超清，约 720p），登录后才给原画 1080p。
+控制台右上角新增 **扫码按钮**，用手机 B 站 App 扫一下即可自动写入 Cookie。
+
+**原理**：走 B 站官方 passport 接口，不碰浏览器，因此没有 cookie 库独占锁、
+也没有 v20(App-Bound) 解密的限制。
+
+1. `GET /x/passport-login/web/qrcode/generate` → 拿到 `qrcode_key` 和二维码内容
+2. 用 `segno`（纯 Python）把内容渲染成 SVG，前端直接显示
+3. 每 2 秒轮询 `GET /x/passport-login/web/qrcode/poll?qrcode_key=...`
+   - `86101` 未扫码 / `86090` 已扫码待确认 / `86038` 已失效 / `0` 成功
+4. 成功时响应头 `Set-Cookie` 里就是 `SESSDATA`、`bili_jct`、`DedeUserID` 等，
+   拼成 Cookie 头后先调 `nav` 接口校验 `isLogin=true`，再写回 `config.ini`
+
+**接口**
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/login/bilibili/qrcode` | 申请二维码，返回 `{key, url, image}`（`image` 是 SVG data URI） |
+| GET | `/api/login/bilibili/poll?key=...` | 轮询状态，成功后自动写配置 |
+
+**注意**
+
+- 二维码有效期约 180 秒，过期后点「刷新二维码」
+- 写回的是 `Cookie.B站cookie`，会复用原来的键名（大小写不敏感），不会产生重复键
+- 写完后点「重启」或等下一轮录制生效
 
 ---
 
@@ -329,10 +360,13 @@ web/
 ├── selftest_config.py  # 配置层自检
 ├── selftest_media.py   # 媒体后处理自检（含无损性验证，无需启动服务）
 ├── selftest_post_process.py # 录完自动处理自检（结束确认、任务分派）
+├── selftest_bili_login.py # 扫码登录自检（不联网，假响应）
 ├── selftest_api.py     # 接口自检
 ├── selftest_frontend.py# 前端静态自检（选择器 / 多语言词条）
 ├── selftest_e2e.py     # 端到端自检（真实启停 main.py）
 └── devtools_screenshot.py # 开发辅助：无头浏览器给各页面截图
+
+bili_login.py         # B 站扫码登录：申请二维码 / 轮询 / 提取 Cookie
 
 src/
 ├── post_process.py     # 录制结束后的自动后处理队列（结束确认、低优先级、串行）
@@ -348,6 +382,7 @@ src/
 python web/selftest_config.py            # 配置读写（无需启动服务）
 python web/selftest_media.py             # 合并/转16:9/压缩 逻辑（含真实 ffmpeg 验证，无需启动服务）
 python web/selftest_post_process.py      # 录完自动处理：结束确认与任务分派（无需启动服务、不需要 ffmpeg）
+python web/selftest_bili_login.py        # 扫码登录：Set-Cookie 解析与状态映射（不联网）
 python web/selftest_frontend.py          # 前端静态检查（无需启动服务）
 python web/selftest_api.py --port 8765   # 73 项接口测试（含媒体后处理接口）
 python web/selftest_e2e.py --port 8765   # 真实启动/停止 main.py 子进程
