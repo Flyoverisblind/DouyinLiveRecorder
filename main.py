@@ -1350,6 +1350,12 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                                     "-bufsize", bufsize,
                                     "-sn", "-dn",
                                     "-reconnect_delay_max", "60",
+                                    # -reconnect_at_eof 必须保留！实测对照（2026-11-09，房间 2603963，
+                                    # 各录 3 分钟，1080p30）：
+                                    #   保留 -> 5401/5402 帧（缺 1，0.02%），时间戳断层 0 处
+                                    #   去掉 -> 4560/5402 帧（缺 842，15.6%），断层 7 处共 28.1 秒
+                                    # 没有它时 ffmpeg 把 HLS 的分片 EOF 当成流结束，重连后跳到直播
+                                    # 最新位置，每次丢一个分片（约 4 秒）。加上它会从断点续读。
                                     "-reconnect_streamed", "-reconnect_at_eof",
                                     "-max_muxing_queue_size", max_muxing_queue_size,
                                     "-correct_ts_overflow", "1",
