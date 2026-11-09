@@ -411,16 +411,19 @@ python web/devtools_screenshot.py --port 8765 --out web/screenshots
 说明 pythonw.exe 进程被外部终止了（任务管理器结束任务、安全软件拦截、误关窗口等）。
 实测 Windows 事件日志里没有 Python 崩溃记录，属于外部查杀而非程序异常。
 
-仓库根目录的 控制台看门狗.bat 可以自愈：检查 8765 端口 → 没监听就启动控制台 →
-再检查录制进程 → 没跑就调接口启动。日志写在 logs/watchdog.log。
+web/watchdog.py 可以自愈：检查端口 → 没监听就启动控制台 → 再检查录制进程 →
+没跑就调接口启动。日志写在 logs/watchdog.log。
 
-已注册为计划任务，每 5 分钟自动检查一次：
+它由计划任务通过 **pythonw.exe** 调用（pythonw 不带控制台），所以每 5 分钟
+检查一次也**不会弹任何窗口**。想手动看结果时再双击仓库根目录的
+控制台看门狗.bat（这个会显示日志尾部）。
 
 `at
-schtasks /query /tn DouyinLiveRecorderWatchdog     :: 查看
-schtasks /run   /tn DouyinLiveRecorderWatchdog     :: 立即执行一次
-schtasks /delete /tn DouyinLiveRecorderWatchdog /f :: 取消自动恢复
+schtasks /query /tn "DouyinLiveRecorderWatchdog"     :: 查看
+schtasks /run   /tn "DouyinLiveRecorderWatchdog"     :: 立即执行一次
+schtasks /delete /tn "DouyinLiveRecorderWatchdog" /f :: 取消自动恢复
 `
+
 
 实测：强杀控制台后执行任务，约 1 秒内控制台和录制都会恢复。
 

@@ -1,37 +1,25 @@
 @echo off
 chcp 936 >nul
 setlocal
-rem ===================================================================
-rem  控制台看门狗：由计划任务每 5 分钟调用一次
-rem  1) 8765 端口没有监听 -> 启动控制台
-rem  2) 控制台起来后，录制进程没在跑 -> 调接口启动录制
-rem  日志：logs\watchdog.log
-rem ===================================================================
+title 控制台看门狗（手动检查）
+
+rem 计划任务用的是 pythonw.exe 直接跑 web\watchdog.py（无窗口）。
+rem 这个 .bat 只是给你手动检查用的：跑完会显示结果，方便确认。
+
 set "ROOT=%~dp0"
-cd /d "%ROOT%"
-set "LOG=%ROOT%logs\watchdog.log"
-if not exist "%ROOT%logs" mkdir "%ROOT%logs"
+if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 
-rem ---- 端口是否在监听
-netstat -ano | findstr /R /C:":8765[ ]" | findstr /I "LISTENING" >nul
-if not errorlevel 1 goto check_recorder
+set "PY=%ROOT%\.venv\Scripts\python.exe"
+if not exist "%PY%" set "PY=python"
 
-echo [%date% %time%] 控制台未运行，正在启动 >> "%LOG%"
-start "" "%ROOT%.venv\Scripts\pythonw.exe" "%ROOT%web\server.py"
-rem 等控制台把端口开起来（最多 20 秒）
-for /l %%i in (1,1,20) do (
-    timeout /t 1 >nul
-    netstat -ano | findstr /R /C:":8765[ ]" | findstr /I "LISTENING" >nul
-    if not errorlevel 1 goto check_recorder
-)
-echo [%date% %time%] 启动后端口仍未监听，等待下次检查 >> "%LOG%"
-exit /b 1
-
-:check_recorder
-rem ---- 录制进程是否在跑（靠 /api/state 判断）
-powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "try { $s = Invoke-RestMethod -Uri 'http://127.0.0.1:8765/api/state' -TimeoutSec 8; if (-not $s.process.running) { Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:8765/api/control/start' -ContentType 'application/json' -Body '{}' -TimeoutSec 30 | Out-Null; Write-Output 'started' } } catch { }" > "%TEMP%\dlr_watchdog_tmp.txt" 2>nul
-findstr /I "started" "%TEMP%\dlr_watchdog_tmp.txt" >nul
-if not errorlevel 1 echo [%date% %time%] 录制进程未运行，已自动启动 >> "%LOG%"
-del "%TEMP%\dlr_watchdog_tmp.txt" >nul 2>nul
-exit /b 0
+echo 正在检查控制台与录制进程 ...
+echo.
+"%PY%" "%ROOT%\web\watchdog.py"
+set "CODE=%ERRORLEVEL%"
+echo.
+echo --- logs\watchdog.log 最后 5 行 ---
+powershell -NoProfile -Command "if (Test-Path '%ROOT%\logs\watchdog.log') { Get-Content '%ROOT%\logs\watchdog.log' -Tail 5 } else { '(还没有日志)' }"
+echo.
+if "%CODE%"=="0" (echo 检查完成。) else (echo 检查过程中有失败，退出码 %CODE%。)
+echo.
+pause
