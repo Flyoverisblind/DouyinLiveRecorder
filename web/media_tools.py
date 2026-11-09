@@ -674,6 +674,43 @@ def prepare_merge(paths: list, project_root: str = None, out_dir: str = None,
     }
 
 
+def detect_gaps(path: str, project_root: str = None, threshold: float = 0.5) -> dict:
+    """统计录像里的时间断层（播放时表现为画面卡住）。
+
+    用音频包时间戳判断：音频没有 B 帧重排，时间戳最可靠。
+    录制过程中断流/重连后 ffmpeg 会跳到直播最新位置，缺的帧无法补回，
+    所以这里只做检测——用来区分「录制时就缺内容」和「合并出了问题」。
+
+    返回 {'ok', 'count', 'total', 'max_gap'}。
+    """
+    try:
+        ffprobe = find_ffprobe(project_root)
+    except MediaError:
+        return {'ok': False, 'count': 0, 'total': 0.0, 'max_gap': 0.0}
+    result = _run([ffprobe, '-v', 'error', '-select_streams', 'a:0',
+                   '-show_entries', 'packet=pts_time', '-of', 'csv=p=0', path],
+                  timeout=7200)
+    if result.returncode != 0:
+        return {'ok': False, 'count': 0, 'total': 0.0, 'max_gap': 0.0}
+    times = []
+    for line in (result.stdout or '').splitlines():
+        line = line.strip().rstrip(',')
+        if not line:
+            continue
+        try:
+            times.append(float(line))
+        except ValueError:
+            continue
+    times.sort()
+    gaps = [b - a for a, b in zip(times, times[1:]) if b - a > threshold]
+    return {
+        'ok': True,
+        'count': len(gaps),
+        'total': round(sum(gaps), 1),
+        'max_gap': round(max(gaps), 2) if gaps else 0.0,
+    }
+
+
 def merge(paths: list, project_root: str = None, out_dir: str = None, job=None,
           faststart: bool = True, drop_source: bool = False, order: str = 'name',
           output: str = None) -> dict:
@@ -686,6 +723,20 @@ def merge(paths: list, project_root: str = None, out_dir: str = None, job=None,
 
     if os.path.exists(output):
         raise MediaError(f'输出文件已存在: {output}')
+
+    _job_update(job, 1.5, '检查源录像的时间连续性')
+    gap_items = []
+    for path in prepared['paths']:
+        info = detect_gaps(path, project_root)
+        if info.get('ok') and info['count']:
+            gap_items.append({'name': os.path.basename(path), **info})
+    if gap_items:
+        gap_count = sum(i['count'] for i in gap_items)
+        gap_seconds = sum(i['total'] for i in gap_items)
+        prepared['warnings'].append(
+            f'源录像本身有 {gap_count} 处时间断层（共 {gap_seconds:.0f} 秒），'
+            f'播放到这些位置会短暂停住。这是录制时断流造成的，'
+            f'合并本身是无损的，缺的画面无法补回。')
 
     ffmpeg = find_ffmpeg(project_root)
     list_path = None
@@ -729,6 +780,7 @@ def merge(paths: list, project_root: str = None, out_dir: str = None, job=None,
         'total_duration': total,
         'warnings': prepared['warnings'],
         'lossless': True,
+        'gaps': gap_items,
     }
     if drop_source:
         removed, errors = [], []
