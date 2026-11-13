@@ -812,9 +812,10 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             if out_dir and not os.path.isdir(out_dir):
                 raise ApiError(f'输出目录不存在: {out_dir}')
             try:
+                order = payload.get('order', 'name')
                 prepared = media_tools.prepare_merge(
                     payload.get('paths') or [], app.project_root,
-                    out_dir=out_dir, order=payload.get('order', 'name'))
+                    out_dir=out_dir, order=order)
             except media_tools.MediaError as exc:
                 raise ApiError(str(exc)) from exc
 
@@ -824,10 +825,12 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             output = prepared['output']
 
             def _run_merge(job, paths_to_merge=paths_to_merge, output=output,
-                           faststart=faststart, drop_source=drop_source):
+                           faststart=faststart, drop_source=drop_source, order=order):
+                # 必须把 order 一起传下去：merge() 内部会再调一次 prepare_merge，
+                # 默认 order='name' 会把用户自定义的顺序重新按文件名排掉。
                 return media_tools.merge(paths_to_merge, app.project_root, job=job,
                                          faststart=faststart, drop_source=drop_source,
-                                         output=output)
+                                         output=output, order=order)
 
             job = app.media_jobs.start(
                 'merge', f'合并 {len(paths_to_merge)} 个文件', _run_merge,

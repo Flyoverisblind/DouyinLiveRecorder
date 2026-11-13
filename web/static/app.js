@@ -88,6 +88,11 @@ const I18N = {
     fileSelected: '已选 {n} 个', nothingSelected: '请先勾选要处理的文件',
     needTwoFiles: '请至少勾选 2 个文件才能合并',
     confirmMerge: '把选中的 {n} 个文件无损拼接为一个视频？\n按文件名顺序拼接（_000/_001…），输出到同一目录，不会重新编码。',
+    mergeOrderTitle: '调整合并顺序',
+    mergeOrderHint: '从上到下就是拼接顺序。用 ↑ ↓ 调整，或直接用文件名排序。',
+    sortByName: '按文件名排序',
+    cancel: '取消',
+    confirm: '开始合并',
     confirmTo169: '把选中的 {n} 个文件裁掉黑边并转为 16:9？\n能无损时只改码流头、不重新编码；否则会重编码（较慢）。',
     mergeStarted: '已加入合并队列', convertStarted: '已加入 {n} 个转换任务',
     jobQueued: '排队中', jobRunning: '处理中', jobDone: '已完成', jobError: '失败', jobCancelled: '已取消',
@@ -148,6 +153,11 @@ const I18N = {
     fileSelected: '{n} selected', nothingSelected: 'Select a file first',
     needTwoFiles: 'Select at least 2 files to merge',
     confirmMerge: 'Merge the {n} selected files into one video without re-encoding?\nFiles are joined in filename order (_000/_001…), output goes next to the source.',
+    mergeOrderTitle: 'Set merge order',
+    mergeOrderHint: 'Top to bottom is the output order. Use ↑ ↓ to move files, or sort by name.',
+    sortByName: 'Sort by filename',
+    cancel: 'Cancel',
+    confirm: 'Start merge',
     confirmTo169: 'Crop the black bars and convert the {n} selected file(s) to 16:9?\nLossless when possible (bitstream header only); otherwise re-encodes (slower).',
     mergeStarted: 'Added to merge queue', convertStarted: 'Queued {n} conversion task(s)',
     jobQueued: 'Queued', jobRunning: 'Running', jobDone: 'Done', jobError: 'Failed', jobCancelled: 'Cancelled',
@@ -354,6 +364,49 @@ async function startBiliQrLogin() {
       if (status) status.textContent = r.error || (en ? 'Failed' : '登录失败');
     }
   }, 2000);
+}
+
+function mergeOrderDialog(paths) {
+  return new Promise((resolve) => {
+    let items = paths.slice();
+    const base = (p) => p.split(/[\\/]/).pop();
+    const render = () => {
+      const rows = items.map((p, i) => `
+        <li class="order-row">
+          <span class="order-idx">${i + 1}</span>
+          <span class="order-name" title="${esc(p)}">${esc(base(p))}</span>
+          <span class="order-ops">
+            <button class="btn tiny ghost" data-act="up" data-i="${i}" ${i === 0 ? 'disabled' : ''}>↑</button>
+            <button class="btn tiny ghost" data-act="down" data-i="${i}" ${i === items.length - 1 ? 'disabled' : ''}>↓</button>
+          </span>
+        </li>`).join('');
+      $('#orderList').innerHTML = rows;
+    };
+    openModal(t('mergeOrderTitle'),
+      `<p class="muted" style="margin:0 0 10px">${esc(t('mergeOrderHint'))}</p>
+       <ul id="orderList" class="order-list"></ul>`,
+      `<button class="btn ghost" id="orderSort">${esc(t('sortByName'))}</button>
+       <button class="btn ghost" id="orderCancel">${esc(t('cancel'))}</button>
+       <button class="btn primary" id="orderOk">${esc(t('confirm'))}</button>`);
+    render();
+    $('#orderList').onclick = (ev) => {
+      const btn = ev.target.closest('button[data-act]');
+      if (!btn) return;
+      const i = Number(btn.dataset.i);
+      const j = btn.dataset.act === 'up' ? i - 1 : i + 1;
+      if (j < 0 || j >= items.length) return;
+      const tmp = items[i];
+      items[i] = items[j];
+      items[j] = tmp;
+      render();
+    };
+    $('#orderSort').onclick = () => {
+      items.sort((a, b) => base(a).localeCompare(base(b), 'zh-CN', { numeric: true }));
+      render();
+    };
+    $('#orderCancel').onclick = () => { closeModal(); resolve(null); };
+    $('#orderOk').onclick = () => { closeModal(); resolve(items); };
+  });
 }
 
 function confirmDialog(message) {
@@ -1126,9 +1179,11 @@ function selectedFilePaths() {
 async function startMergeSelected() {
   const paths = selectedFilePaths();
   if (paths.length < 2) { toast(t('needTwoFiles'), 'warn'); return; }
-  if (!await confirmDialog(t('confirmMerge', { n: paths.length }))) return;
+  // 先让用户确认/调整拼接顺序：order='manual' 表示按传入顺序，不让后端再按文件名排序
+  const ordered = await mergeOrderDialog(paths);
+  if (!ordered) return;
   try {
-    const result = await api('/api/media/merge', { method: 'POST', body: { paths } });
+    const result = await api('/api/media/merge', { method: 'POST', body: { paths: ordered, order: 'manual' } });
     S.jobsHidden = false;
     toast(t('mergeStarted'), 'ok');
     if (result.job) renderJobs([result.job]);
